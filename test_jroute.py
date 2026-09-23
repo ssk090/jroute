@@ -7,6 +7,8 @@ token accounting, and redaction. These are the seams where routing bugs would hi
 
 import io
 import json
+import os
+import re
 import sys
 import tempfile
 import unittest
@@ -338,40 +340,57 @@ class TestPlanPath(unittest.TestCase):
 
 
 EXPECTED_TEXT_ALL_OK = (
-    "jroute status\n"
+    "  🧭 jroute  ·  quota, routes, and what is excluded\n"
+    "  ──────────────────────────────────────────────────────────────────────────\n"
     "\n"
-    "codex        OK        5h 10% (reset 4h41m)  7d 56% (reset 45h37m)\n"
-    "cursor       OK        auto 73.2%  api 8.6%  total 67.3%\n"
-    "             auto bucket contains 2 models (composer-2.5, grok-4.5 ladders)\n"
-    "opencode-go  FLAT      6 models, no usage endpoint exists\n"
+    "  ✅ codex                 ready\n"
+    "     █░░░░░░░░░  5h 10%               ⏱ 4h41m left\n"
+    "     ██████░░░░  7d 56%               ⏱ 45h37m left\n"
     "\n"
-    "stage routes\n"
-    "  answer   -> opencode-go/deepseek-v4.1-flash  (low)\n"
-    "  plan     -> openai-codex/gpt-6-astra  (medium)\n"
-    "  execute  -> opencode-go/deepseek-v4.1-flash  (low)\n"
-    "  review   -> opencode-go/glm-5.3  (medium)\n"
+    "  ✅ cursor                ready\n"
+    "     ███████░░░  auto 73%               2 models on this bucket\n"
+    "     █░░░░░░░░░  api  9%                frontier tier, nearly idle\n"
+    "     ███████░░░  all  67%\n"
     "\n"
-    "exclusions\n"
-    "  anthropic model, excluded by policy: cursor/claude-opus-5-high\n"
+    "  ♾ opencode-go           flat rate\n"
+    "     6 models, no per-token cost, no usage endpoint\n"
+    "\n"
+    "  🧩 routes\n"
+    "  💬 answer:    opencode-go/deepseek-v4.1-flash         low     (opencode-go)\n"
+    "  📋 plan:      openai-codex/gpt-6-astra                medium  (openai-codex)\n"
+    "  🔨 execute:   opencode-go/deepseek-v4.1-flash         low     (opencode-go)\n"
+    "  🔍 review:    opencode-go/glm-5.3                     medium  (opencode-go)\n"
+    "\n"
+    "  ⚠ excluded\n"
+    "     anthropic model, excluded by policy\n"
+    "       cursor/claude-opus-5-high\n"
 )
 
 EXPECTED_TEXT_PROBE_ERROR = (
-    "jroute status\n"
+    "  🧭 jroute  ·  quota, routes, and what is excluded\n"
+    "  ──────────────────────────────────────────────────────────────────────────\n"
     "\n"
-    "codex        ERROR    RuntimeError: boom\n"
-    "cursor       OK        auto 73.2%  api 8.6%  total 67.3%\n"
-    "             auto bucket contains 2 models (composer-2.5, grok-4.5 ladders)\n"
-    "opencode-go  FLAT      6 models, no usage endpoint exists\n"
+    "  ❌ codex                 RuntimeError: boom\n"
     "\n"
-    "stage routes\n"
-    "  answer   -> opencode-go/deepseek-v4.1-flash  (low)\n"
-    "  plan     -> cursor/gpt-5.6-sol-high  (medium)\n"
-    "  execute  -> opencode-go/deepseek-v4.1-flash  (low)\n"
-    "  review   -> opencode-go/glm-5.3  (medium)\n"
+    "  ✅ cursor                ready\n"
+    "     ███████░░░  auto 73%               2 models on this bucket\n"
+    "     █░░░░░░░░░  api  9%                frontier tier, nearly idle\n"
+    "     ███████░░░  all  67%\n"
     "\n"
-    "exclusions\n"
-    "  codex quota unknown (probe failed): openai-codex/gpt-5.6-luna, openai-codex/gpt-6-astra, openai-codex/gpt-5.6-sol\n"
-    "  anthropic model, excluded by policy: cursor/claude-opus-5-high\n"
+    "  ♾ opencode-go           flat rate\n"
+    "     6 models, no per-token cost, no usage endpoint\n"
+    "\n"
+    "  🧩 routes\n"
+    "  💬 answer:    opencode-go/deepseek-v4.1-flash         low     (opencode-go)\n"
+    "  📋 plan:      cursor/gpt-5.6-sol-high                 medium  (cursor)\n"
+    "  🔨 execute:   opencode-go/deepseek-v4.1-flash         low     (opencode-go)\n"
+    "  🔍 review:    opencode-go/glm-5.3                     medium  (opencode-go)\n"
+    "\n"
+    "  ⚠ excluded\n"
+    "     codex quota unknown (probe failed)\n"
+    "       openai-codex/gpt-5.6-luna, openai-codex/gpt-6-astra, openai-codex/gpt-5.6-sol\n"
+    "     anthropic model, excluded by policy\n"
+    "       cursor/claude-opus-5-high\n"
 )
 
 
@@ -500,15 +519,15 @@ class TestStatusJson(unittest.TestCase):
         self.assertEqual(payload["snapshots"]["cursor"]["auto_bucket"], [])
 
 
-class TestStatusTextUnchanged(unittest.TestCase):
-    def test_default_text_output_is_unchanged(self):
+class TestStatusTextFormat(unittest.TestCase):
+    def test_default_text_output_pins_the_human_format(self):
         buf = io.StringIO()
         with patch.object(jroute, "probe_all", return_value=(ALL_OK, {})):
             with redirect_stdout(buf):
                 jroute.cmd_status(CONFIG)
         self.assertEqual(buf.getvalue(), EXPECTED_TEXT_ALL_OK)
 
-    def test_probe_error_text_output_is_unchanged(self):
+    def test_probe_error_text_output_pins_the_human_format(self):
         snaps = {"cursor": CURSOR_OK, "opencode-go": OPENCODE_OK}
         buf = io.StringIO()
         with patch.object(jroute, "probe_all", return_value=(snaps, {"codex": "RuntimeError: boom"})):
@@ -868,6 +887,85 @@ class TestStreamRendering(unittest.TestCase):
         stream = jroute.SessionStream(Path("/nonexistent/nope.jsonl"), enabled=True)
         stream.poll()
         self.assertEqual(stream.summary(), "")
+
+
+class TestPresentation(unittest.TestCase):
+    """The human format. Colours are gated on a TTY, emoji on JROUTE_PLAIN, and the one
+    subtle rule is that padding happens before painting."""
+
+    def visible(self, text):
+        return re.sub(r"\033\[[0-9;]*m", "", text)
+
+    def test_pad_pads_before_painting_so_columns_align(self):
+        """Padding a painted string counts the ANSI escapes as characters, which silently
+        misaligns every coloured column. This is the regression guard for that."""
+        padded = jroute.pad("codex", 10, "bold", enabled=True)
+        self.assertTrue(padded.startswith("\033[1m"))
+        self.assertEqual(self.visible(padded), "codex     ")
+        self.assertEqual(len(self.visible(padded)), 10)
+
+    def test_paint_emits_no_escapes_when_disabled(self):
+        self.assertEqual(jroute.paint("ready", "green", enabled=False), "ready")
+
+    def test_paint_wraps_and_resets_when_enabled(self):
+        painted = jroute.paint("ready", "green", enabled=True)
+        self.assertEqual(painted, "\033[32mready\033[0m")
+
+    def test_no_color_env_disables_colour_even_on_a_tty(self):
+        with patch.dict(os.environ, {"NO_COLOR": "1"}):
+            self.assertFalse(jroute.color_enabled())
+
+    def test_colour_is_off_when_stdout_is_not_a_tty(self):
+        self.assertFalse(jroute.color_enabled(io.StringIO()))
+
+    def test_bar_fills_in_proportion_to_what_is_spent(self):
+        self.assertEqual(self.visible(jroute.bar(0, 10, enabled=False)), "\u2591" * 10)
+        self.assertEqual(self.visible(jroute.bar(100, 10, enabled=False)), "\u2588" * 10)
+        self.assertEqual(self.visible(jroute.bar(50, 10, enabled=False)),
+                         "\u2588" * 5 + "\u2591" * 5)
+
+    def test_bar_clamps_out_of_range_input(self):
+        self.assertEqual(self.visible(jroute.bar(None, 10, enabled=False)), "\u2591" * 10)
+        self.assertEqual(self.visible(jroute.bar(-20, 10, enabled=False)), "\u2591" * 10)
+        self.assertEqual(self.visible(jroute.bar(999, 10, enabled=False)), "\u2588" * 10)
+
+    def test_bar_is_always_the_same_visible_width(self):
+        for pct in (0, 1, 33, 67, 99, 100):
+            self.assertEqual(len(self.visible(jroute.bar(pct, 10, enabled=False))), 10)
+
+    def test_bar_turns_red_on_a_hot_pool(self):
+        self.assertIn("\033[32m", jroute.bar(10, 10, enabled=True))
+        self.assertIn("\033[33m", jroute.bar(70, 10, enabled=True))
+        self.assertIn("\033[31m", jroute.bar(95, 10, enabled=True))
+
+    def test_health_reports_unknown_rather_than_a_fake_zero(self):
+        self.assertEqual(jroute.health(None, enabled=False), "unknown")
+        self.assertEqual(jroute.health(42, enabled=False), "42%")
+
+    def test_emoji_can_be_suppressed_for_logs(self):
+        self.assertEqual(jroute.emoji("plan", plain=True), "")
+        self.assertIn("\U0001f4cb", jroute.emoji("plan"))
+        self.assertEqual(jroute.emoji("nonexistent"), " ")
+
+    def test_stage_lines_line_up_across_stages(self):
+        rows = [self.visible(jroute.stage_line(stage, "opencode-go/glm-5.3", "medium",
+                                              plain=True))
+                for stage in ("answer", "plan", "execute", "review")]
+        model_columns = {row.index("opencode-go/glm-5.3") for row in rows}
+        self.assertEqual(len(model_columns), 1, "the model column must start at one offset")
+        effort_columns = {row.index("medium") for row in rows}
+        self.assertEqual(len(effort_columns), 1, "the effort column must start at one offset")
+
+    def test_stage_line_marks_a_route_with_no_eligible_model(self):
+        self.assertIn("NOTHING ELIGIBLE",
+                      self.visible(jroute.stage_line("plan", None, "medium", plain=True)))
+
+    def test_banner_is_two_lines_and_carries_the_subtitle(self):
+        text = self.visible(jroute.banner("jroute", "a subtitle", enabled=False))
+        self.assertEqual(len(text.splitlines()), 2)
+        self.assertIn("jroute", text)
+        self.assertIn("a subtitle", text)
+        self.assertIn("\u2500", text)
 
 
 class TestProviderArgv(unittest.TestCase):

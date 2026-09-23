@@ -874,6 +874,90 @@ class SessionStream:
 
 
 # --------------------------------------------------------------------------------------
+# presentation
+# --------------------------------------------------------------------------------------
+
+COLORS = {"reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m", "red": "\033[31m",
+          "green": "\033[32m", "yellow": "\033[33m", "blue": "\033[34m",
+          "magenta": "\033[35m", "cyan": "\033[36m"}
+
+# Single-codepoint emoji only: a variation selector changes the rendered width and knocks
+# every aligned column out by a character.
+EMOJI = {
+    "codex": "\U0001f916", "cursor": "\U0001f3af", "opencode-go": "\U0001f680",
+    "plan": "\U0001f4cb", "execute": "\U0001f528", "review": "\U0001f50d",
+    "answer": "\U0001f4ac", "jev": "\U0001f9e0", "shape": "\U0001f9e9",
+    "ok": "\u2705", "warn": "\u26a0", "bad": "\u274c", "flat": "\u267e",
+    "clock": "\u23f1", "tokens": "\U0001f522", "cost": "\U0001f4b0",
+    "think": "\U0001f4ad", "say": "\u270e", "tool": "\u2192", "plan_art": "\U0001f4c4",
+    "brand": "\U0001f9ed", "check": "\u2714", "spark": "\u2728",
+}
+
+
+def color_enabled(stream=None):
+    stream = stream or sys.stdout
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def paint(text, *styles, enabled=None):
+    if enabled is None:
+        enabled = color_enabled()
+    if not enabled or not styles:
+        return text
+    prefix = "".join(COLORS.get(style, "") for style in styles)
+    return f"{prefix}{text}{COLORS['reset']}"
+
+
+def emoji(name, plain=False):
+    return "" if plain else EMOJI.get(name, "") + " "
+
+
+def pad(text, width, *styles, enabled=None):
+    """Pad first, paint second. Padding a painted string counts ANSI escapes as characters,
+    which silently misaligns every column that uses colour."""
+    return paint(f"{str(text):<{width}}", *styles, enabled=enabled)
+
+
+def bar(pct, width=10, enabled=None):
+    """A quota bar. It fills with what is spent, so a fuller bar is a hotter pool."""
+    pct = 0 if pct is None else max(0.0, min(100.0, float(pct)))
+    filled = int(round(pct / 100 * width))
+    tone = "green" if pct < 60 else ("yellow" if pct < 85 else "red")
+    body = "\u2588" * filled + "\u2591" * (width - filled)
+    return paint(body, tone, enabled=enabled)
+
+
+def health(pct, enabled=None):
+    """Status glyph and colour for one quota window."""
+    if pct is None:
+        return paint("unknown", "dim", enabled=enabled)
+    tone = "green" if pct < 60 else ("yellow" if pct < 85 else "red")
+    return paint(f"{pct:.0f}%", tone, "bold", enabled=enabled)
+
+
+def banner(title, subtitle="", enabled=None, width=74):
+    """A header plus a rule. No closing corner: an unclosed frame reads as a section, and it
+    lines up at any terminal width."""
+    head = f"  {emoji('brand')}{paint(title, 'bold', 'cyan', enabled=enabled)}"
+    if subtitle:
+        head += paint(f"  \u00b7  {subtitle}", "dim", enabled=enabled)
+    return head + "\n  " + paint("\u2500" * width, "dim", enabled=enabled)
+
+
+def stage_line(stage, model, effort, note="", plain=False, enabled=None):
+    glyph = emoji(stage, plain)
+    route = (pad(model, 40, "bold", enabled=enabled) if model
+             else pad("NOTHING ELIGIBLE", 40, "red", enabled=enabled))
+    return (f"  {glyph}{pad(stage + ':', 11, 'bold', enabled=enabled)}"
+            f"{route}{pad(effort, 8, 'dim', enabled=enabled)}{note}")
+
+
+# --------------------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------------------
 
@@ -922,49 +1006,77 @@ def cmd_status(config, json_mode=False, full=False):
         print(json.dumps(payload))
         return
 
-    print("jroute status\n")
+    on = color_enabled()
+    plain = os.environ.get("JROUTE_PLAIN") == "1"
+    print(banner("jroute", "quota, routes, and what is excluded", enabled=on))
+    print()
     codex = snaps.get("codex")
     if codex:
         codex_excluded = [reason for mid, reason in excluded
                           if mid.startswith("openai-codex/")]
-        print(f"codex        {'GATED    ' if codex_excluded else 'OK       '} "
-              f"5h {codex['primary_used']:.0f}% (reset {fmt_reset(codex['reset_primary_s'])})  "
-              f"7d {codex['secondary_used']:.0f}% (reset {fmt_reset(codex['reset_secondary_s'])})")
+        mark = emoji("warn", plain) if codex_excluded else emoji("ok", plain)
+        verdict = paint("gated", "yellow") if codex_excluded else paint("ready", "green")
+        print(f"  {mark}{pad('codex', 22, 'bold', enabled=on)}{verdict}")
+        print(f"     {bar(codex['primary_used'], enabled=on)}  "
+              f"5h {pad(health(codex['primary_used'], on), 18)}"
+              f"{emoji('clock', plain)}{fmt_reset(codex['reset_primary_s'])} left")
+        print(f"     {bar(codex['secondary_used'], enabled=on)}  "
+              f"7d {pad(health(codex['secondary_used'], on), 18)}"
+              f"{emoji('clock', plain)}{fmt_reset(codex['reset_secondary_s'])} left")
         for mid, reason in codex_excluded:
-            print(f"             excluded: {reason}")
+            print(f"     {paint(reason, 'dim', enabled=on)}")
         for model, avail in (codex.get("model_available") or {}).items():
             if not avail:
-                print(f"             model gated: {model}")
+                print(f"     {paint('model gated: ' + model, 'dim', enabled=on)}")
     else:
-        print(f"codex        ERROR    {errors.get('codex')}")
+        print(f"  {emoji('bad', plain)}{pad('codex', 22, 'bold', enabled=on)}"
+              f"{paint(errors.get('codex', 'probe failed'), 'red', enabled=on)}")
 
     cur = snaps.get("cursor")
     if cur:
-        print(f"cursor       OK        auto {cur['auto_used']:.1f}%  "
-              f"api {cur['api_used']:.1f}%  total {cur['total_used']:.1f}%")
-        print(f"             auto bucket contains {len(cur['auto_bucket'])} models "
-              f"(composer-2.5, grok-4.5 ladders)")
+        auto_hot = cur["auto_used"] is not None and cur["auto_used"] >= 85
+        mark = emoji("warn", plain) if auto_hot else emoji("ok", plain)
+        verdict = paint("partial", "yellow") if auto_hot else paint("ready", "green")
+        print(f"\n  {mark}{pad('cursor', 22, 'bold', enabled=on)}{verdict}")
+        bucket_note = paint(f"{len(cur['auto_bucket'])} models on this bucket",
+                            "dim", enabled=on)
+        print(f"     {bar(cur['auto_used'], enabled=on)}  "
+              f"auto {pad(health(cur['auto_used'], on), 18)}{bucket_note}")
+        print(f"     {bar(cur['api_used'], enabled=on)}  "
+              f"api  {pad(health(cur['api_used'], on), 18)}"
+              f"{paint('frontier tier, nearly idle', 'dim', enabled=on)}")
+        print(f"     {bar(cur['total_used'], enabled=on)}  "
+              f"all  {health(cur['total_used'], on)}")
     else:
-        print(f"cursor       ERROR    {errors.get('cursor')}")
+        print(f"\n  {emoji('bad', plain)}{pad('cursor', 22, 'bold', enabled=on)}"
+              f"{paint(errors.get('cursor', 'probe failed'), 'red', enabled=on)}")
 
     oc = snaps.get("opencode-go")
     if oc:
-        print(f"opencode-go  FLAT      {len(oc['models'])} models, no usage endpoint exists")
+        print(f"\n  {emoji('flat', plain)}{pad('opencode-go', 22, 'bold', enabled=on)}"
+              f"{paint('flat rate', 'green', enabled=on)}")
+        catalog_note = paint(f"{len(oc['models'])} models, no per-token cost, "
+                             "no usage endpoint", "dim", enabled=on)
+        print(f"     {catalog_note}")
     else:
-        print(f"opencode-go  ERROR    {errors.get('opencode-go')}")
+        print(f"\n  {emoji('bad', plain)}{pad('opencode-go', 22, 'bold', enabled=on)}"
+              f"{paint(errors.get('opencode-go', 'probe failed'), 'red', enabled=on)}")
 
-    print("\nstage routes")
-    seen_excluded = {}
-    for mid, reason in excluded:
-        seen_excluded.setdefault(reason, []).append(mid)
+    print(f"\n  {emoji('shape', plain)}{paint('routes', 'bold', enabled=on)}")
     for stage in config["stages"]:
         chosen = resolve(stage, ok_ids, config)
         effort = config["effort"].get(stage, "")
-        print(f"  {stage:8} -> {chosen or 'NOTHING ELIGIBLE'}  ({effort})")
+        provider = chosen.split("/")[0] if chosen else ""
+        note = paint(f"({provider})", "dim", enabled=on) if provider else ""
+        print(stage_line(stage, chosen, effort, note, plain, on))
+    seen_excluded = {}
+    for mid, reason in excluded:
+        seen_excluded.setdefault(reason, []).append(mid)
     if seen_excluded:
-        print("\nexclusions")
+        print(f"\n  {emoji('warn', plain)}{paint('excluded', 'bold', enabled=on)}")
         for reason, ids in seen_excluded.items():
-            print(f"  {reason}: {', '.join(ids)}")
+            print(f"     {paint(reason, 'dim', enabled=on)}")
+            print(f"       {paint(', '.join(ids), 'dim', enabled=on)}")
 
 
 def answer_argv(route, effort):
@@ -1020,28 +1132,40 @@ def cmd_run(task, config, args):
     start = jev_start_index(answers)
     ok_ids, excluded = eligible(snaps, config, all_chain_models(config))
 
-    print(f"jroute: {task}\n")
+    on = color_enabled()
+    plain = os.environ.get("JROUTE_PLAIN") == "1"
+    shape = (args.stage,) if args.stage else jev_shape(answers, config)
+    print(banner("jroute", task[:56], enabled=on))
+
     if answers:
         comp = answers.get("complexity") or {}
-        print(f"  jev: {(answers.get('family') or {}).get('choice')}  "
-              f"complexity {comp.get('score')} (conf {comp.get('confidence')})  "
-              f"question {noul(answers, 'is_question'):.2f}  "
-              f"needs_design {noul(answers, 'needs_design'):.2f}  "
-              f"consequence {noul(answers, 'consequence'):.2f}")
+        family = (answers.get("family") or {}).get("choice")
+        score = comp.get("score")
+        confidence = comp.get("confidence")
+        print(f"\n  {emoji('jev', plain)}{pad('jev', 11, 'bold', enabled=on)}"
+              f"{paint(str(family), 'magenta', 'bold', enabled=on)} "
+              f"{paint(f'complexity {score} (conf {confidence})', 'dim', enabled=on)}")
+        print(f"     {pad('', 11)}{paint('question', 'dim', enabled=on)} "
+              f"{noul(answers, 'is_question'):.2f}   "
+              f"{paint('design', 'dim', enabled=on)} {noul(answers, 'needs_design'):.2f}   "
+              f"{paint('consequence', 'dim', enabled=on)} "
+              f"{noul(answers, 'consequence'):.2f}")
     elif not args.no_jev and not args.stage:
-        print("  jev: unavailable, starting each chain at its cheapest eligible model")
+        print(f"\n  {emoji('warn', plain)}{paint('jev unavailable, chains start at their cheapest', 'dim', enabled=on)}")
 
-    shape = (args.stage,) if args.stage else jev_shape(answers, config)
-    print(f"  shape: {' -> '.join(shape)}")
+    print(f"  {emoji('shape', plain)}{pad('shape', 11, 'bold', enabled=on)}"
+          f"{paint(' \u2192 '.join(shape), 'cyan', 'bold', enabled=on)}")
+    print()
 
     if shape == ("answer",):
         route = resolve("answer", ok_ids, config, start)
         if not route:
-            print("  answer: NO ELIGIBLE MODEL")
+            print(f"  {emoji('bad', plain)}{paint('answer: NO ELIGIBLE MODEL', 'red', enabled=on)}")
             return 1
         effort = config["effort"].get("answer", "low")
         if args.dry_run:
-            print(f"  answer   -> {route}  ({effort})  headless")
+            print(stage_line("answer", route, effort, paint("(headless)", "dim", enabled=on),
+                             plain, on))
             return 0
         return cmd_answer(task, route, effort, args.timeout)
 
@@ -1054,24 +1178,26 @@ def cmd_run(task, config, args):
         skip = tuple(ran_families) if stage == "review" else ()
         route = resolve(stage, ok_ids, config, offset, skip)
         if not route:
-            print(f"  {stage}: NO ELIGIBLE MODEL")
+            print(f"  {emoji('bad', plain)}{paint(f'{stage}: NO ELIGIBLE MODEL', 'red', enabled=on)}")
             for mid in config["stages"][stage]:
                 reason = dict(excluded).get(mid, "filtered by the review family constraint")
-                print(f"      {mid}: {reason}")
+                print(f"     {paint(mid, 'dim', enabled=on)}: {paint(reason, 'dim', enabled=on)}")
             exit_code = 1
             break
         chain = config["stages"][stage]
-        note = "" if route == chain[0] else f"  (chain offset {offset})"
-        print(f"  {stage:8} -> {route}  ({config['effort'].get(stage, '')})  "
-              f"pane jroute-{stage}{note}")
+        note = "" if route == chain[0] else paint(f"  (chain offset {offset})",
+                                                "yellow", enabled=on)
         if args.dry_run:
-            print(f"      brief -> {plan_path_for(task)}")
+            note += paint(f"  {emoji('plan_art', plain)}{plan_path_for(task).name}",
+                          "dim", enabled=on)
+        print(stage_line(stage, route, config["effort"].get(stage, ""), note, plain, on))
+        if args.dry_run:
             continue
         rec = run_stage(stage, task, route, config, keep_panes=args.keep_panes,
                         focus=args.focus, timeout_s=args.timeout,
                         has_plan=("plan" in shape) or stage == "review")
         if not rec:
-            print(f"  {stage}: aborted, stopping the pipeline")
+            print(f"  {emoji('bad', plain)}{paint(f'{stage}: aborted, stopping the pipeline', 'red', enabled=on)}")
             exit_code = 1
             break
         rec["jev"] = answers
@@ -1088,7 +1214,9 @@ def cmd_run(task, config, args):
                 rec["task_sha256"] = digest
                 rec["ts"] = time.time()
                 fh.write(json.dumps(rec) + "\n")
-        print(f"\nlogged {len(records)} stage(s) to {LOG_PATH}")
+        stages_done = paint(" \u2192 ".join(r["stage"] for r in records), "cyan", enabled=on)
+        print(f"\n  {emoji('check', plain)}{stages_done}  "
+              f"{paint(f'logged {len(records)} stage(s) to {LOG_PATH}', 'dim', enabled=on)}")
     return exit_code
 
 
