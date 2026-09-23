@@ -343,7 +343,7 @@ Choosing `gpt-5.4-mini` over `gpt-5.6-sol` saves a few times over on one stage. 
 
 ### Token budget: warn, do not abort
 
-Per stage, warn at a configurable threshold (start at 150k tokens summed across input plus output plus cacheRead for that stage's session). On breach:
+Per stage, warn at a configurable threshold. Measured live: one plan stage 317,991 tokens, one execute stage 705,961, one review stage 505,877. Config therefore sets `token_warn` per stage at 400000 / 900000 / 650000, roughly 25% headroom over the measurements. On breach:
 
 - Print a warning on the stage line and continue the stage.
 - Log the actual total to the decision record so the overspend is visible next to the route that produced it.
@@ -389,17 +389,62 @@ Read the per-stage number from the pi session JSONL (per-message `input`, `outpu
 ```
 jroute run "implement CHP-1234"        # full pipeline
 jroute run "..." --stage plan          # one stage only
-jroute run "..." --no-focus --keep-panes
-jroute run "..." --dry-run             # no Jev call, no panes
+jroute run "..." --keep-panes          # do not close stage panes
+jroute run "..." --focus               # move focus to each stage pane (default: keep yours)
+jroute run "..." --no-jev              # skip the Jev call, start chains at their cheapest
+jroute run "..." --dry-run             # no panes, prints routes and brief paths
 jroute status                          # three quota pools, resets, eligibility
+jroute status --json                   # same as JSON: snapshots, errors, routes, exclusions
 jroute log                             # last N decisions
 ```
+
+`JROUTE_JEV_FIXTURE=<file>` replays a recorded Jev response, so routing decisions are
+reproducible offline without a key or a call.
 
 `--dry-run` is how you tune thresholds without burning quota or spawning panes. `--stage` is how you use the pipeline one piece at a time while building it.
 
 ---
 
-## 12. First three actions
+## 13. Verification log
+
+Everything below was run, not reasoned about. Where a claim in earlier sections turned out
+wrong, the correction is here rather than silently edited away.
+
+### Proven working
+
+| Claim | Evidence |
+|---|---|
+| Codex quota readable | `wham/usage` returns 5h and 7d windows with `used_percent` and `reset_at`. Live values tracked 10% to 23% over this session. |
+| Cursor quota readable | `GetCurrentPeriodUsage` via keychain token. auto 73.2%, api 9.4%, total 67.4%. |
+| Per-bucket Cursor gating works | 28 models list as auto-bucket members; api-bucket models stay eligible at 9.4%. |
+| Codex gate falls through out of Codex | Forcing `primary_5h_max` to 5% moved the plan route to `cursor/gpt-5.6-sol-high` and dropped `gpt-5.6-luna` from the execute chain. |
+| pi launches Codex and OpenCode Go for all three stages | `herdr agent start plan --kind pi -- --model openai-codex/gpt-6-astra --thinking medium` returned `interactive_ready: true` and handed back the pi session path. |
+| cursor-agent launches | `--kind cursor -- --model gpt-5.6-sol-high` started and completed a real task. |
+| Path handoff works | Astra wrote a 35-line plan with all four sections; `deepseek-v4.1-flash` read it from disk on a different subscription and implemented it, adding 15 tests; `glm-5.3` reviewed it and found a real issue. |
+| Jev routes by complexity | routine task: `chore` 0.97, complexity 0.12, offset 0, cheapest models. Hard task: `implement` 0.56, complexity 2.83, consequence 0.81, offset 2, strongest models. 448 Jev input tokens per call. |
+| Review independence enforced | Hard-task run paired a `qwen3` executor with a `kimi` reviewer. |
+| Token accounting | `cacheRead` is 42x output on a normal agent session, which is why the budget is reported per component rather than folded into one number. |
+
+### Corrections to earlier sections
+
+- **Plan stage is pinned.** Section 8's "escalate on evidence" must not apply to the plan chain: `gpt-6-astra` leads it by explicit instruction, so `cmd_run` pins that offset to zero. Without the pin, a hard task moved planning onto `cursor/gpt-5.6-sol-high`, which is not what was asked for.
+- **Token budget is per stage, not one number.** Section 9 originally said to start at 150k. Measured costs are 318k, 706k, and 506k, so one threshold is meaningless.
+- **`opencode-go/kimi-k3-high` does not exist**, and its absence caught a real bug: OpenCode Go has `kimi-k3`. The catalog is now probed and validated against, so a wrong-provider model id is rejected at routing time instead of failing at launch.
+- **`--no-focus` is the default, not a flag.** Section 11 listed it as one. The actual flags are `--focus` to opt into focus stealing, `--keep-panes`, and `--no-jev`.
+
+### Not built, deliberately
+
+- **Escalation on evidence** (section 8): a failed stage stops the pipeline and keeps its pane instead of advancing along the chain. The gate that would trigger it exists in the log; the chain walk does not.
+- **The `stuck-crewmate-recovery` ladder** (section 2, Phase 5): `dismiss_dialogs` handles the trust dialogs, but there is no peek, steer, interrupt, or relaunch. A wedged stage currently waits out its timeout.
+- **Cursor model-id validation**: OpenCode Go ids are validated against the live catalog, Cursor ids are not. A typo in a Cursor id still fails at launch.
+
+### Remaining unknown
+
+`cursor-agent`'s busy signature, exit command, and interrupt key are still unverified. `herdr agent prompt --wait` uses Herdr's own status detection, so the happy path does not need them, but the stuck-stage ladder above cannot be written correctly without them.
+
+---
+
+## 14. First three actions
 
 1. Get a Jev key and confirm one `systemone` call.
 2. Prove the pane layer by hand: split, start pi with a Codex model, prompt, read, close. That validates the riskiest assumption in the whole plan in about five minutes.

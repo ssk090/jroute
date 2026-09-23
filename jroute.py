@@ -159,7 +159,11 @@ def eligible(snaps, config, models):
             else:
                 ok.append(mid)
         elif provider == "opencode-go":
-            ok.append(mid)  # flat rate, no quota gate
+            catalog = (snaps.get("opencode-go") or {}).get("models")
+            if catalog is not None and name not in catalog:
+                excluded.append((mid, "not in the live opencode-go catalog"))
+            else:
+                ok.append(mid)  # flat rate, no quota gate
         elif provider == "cursor":
             c = snaps.get("cursor")
             if not c:
@@ -185,12 +189,48 @@ def eligible(snaps, config, models):
     return ok, excluded
 
 
-def resolve(stage, ok_ids, config):
-    """First model in the stage chain that survived the gates. Deterministic, no Jev."""
-    for mid in config["stages"][stage]:
-        if mid in ok_ids:
-            return mid
-    return None
+def resolve(stage, ok_ids, config, start=0, exclude_families=()):
+    """Walk the stage chain and take the first eligible hit, offset by `start`.
+
+    Jev never picks a model. It picks how far along the chain to start, so a hard task
+    skips the cheapest tier instead of burning a failed attempt there, and the chain
+    itself stays the deterministic policy. `exclude_families` keeps the review stage off
+    the executor's family, so review is not the executor reviewing itself.
+    """
+    usable = [m for m in config["stages"][stage]
+              if m in ok_ids and family_of(m) not in exclude_families]
+    if not usable:
+        return None
+    return usable[min(max(start, 0), len(usable) - 1)]
+
+
+def family_of(model_id):
+    """Model family prefix, used for review independence. gpt-5.6-sol and gpt-6-astra are
+    both 'gpt'; deepseek-v4.1-flash is 'deepseek'; qwen3.8-flash is 'qwen3'."""
+    name = model_id.split("/", 1)[1] if "/" in model_id else model_id
+    return re.split(r"[-.]", name)[0].lower()
+
+
+def jev_start_index(answers):
+    """Map Jev's judgment onto a chain offset. Not a model choice, a starting point.
+
+    Deliberately conservative in one direction only: under-powering a task costs a failed
+    attempt plus the escalation, so low confidence rounds complexity up, never down.
+    """
+    if not answers:
+        return 0
+    complexity = answers.get("complexity") or {}
+    score = complexity.get("score")
+    if score is None:
+        return 0
+    confidence = complexity.get("confidence") or 0
+    consequence = (answers.get("consequence") or {}).get("noul") or 0
+    effective = score + (1 if confidence < 0.6 else 0)
+    if effective >= 3 or consequence > 0.7:
+        return 2
+    if effective >= 2:
+        return 1
+    return 0
 
 
 # --------------------------------------------------------------------------------------
@@ -212,8 +252,52 @@ def redact(text):
     return out
 
 
+JEV_QUESTIONS = {
+    "family": {
+        "type": "choice",
+        "instructions": "What kind of work is this?",
+        "criteria": {
+            "plan": "design, specification, or architecture of new work",
+            "implement": "execute an approved or well-specified change",
+            "debug": "diagnose a failure or unexpected behaviour",
+            "review": "audit or critique existing work",
+            "chore": "mechanical, repetitive, or trivial change",
+        },
+    },
+    "complexity": {
+        "type": "score",
+        "instructions": "How much reasoning does this task need?",
+        "criteria": ["trivial", "routine", "moderate", "hard", "frontier"],
+    },
+    "consequence": {
+        "type": "noul",
+        "instructions": "Would a wrong answer here be expensive to undo, or does this "
+                        "touch high-risk ground such as production, security, money, or "
+                        "data loss?",
+    },
+    "min_effort": {
+        "type": "choice",
+        "instructions": "What is the minimum reasoning effort likely to be sufficient?",
+        "criteria": {"low": "bounded, well-understood change",
+                     "medium": "some judgment required",
+                     "high": "subtle, high-consequence, or deeply uncertain"},
+    },
+}
+
+
 def jev_ask(state, questions):
-    """One batched systemone call. Returns None when unavailable, which is not an error."""
+    """One batched systemone call. Returns None when unavailable, which is not an error.
+
+    JROUTE_JEV_FIXTURE points at a recorded response, so routing decisions can be replayed
+    offline and reproducibly without spending a call or needing a key.
+    """
+    fixture = os.environ.get("JROUTE_JEV_FIXTURE")
+    if fixture:
+        try:
+            return json.loads(Path(fixture).read_text())
+        except (OSError, ValueError) as exc:
+            print(f"  jev: fixture unreadable ({exc})", file=sys.stderr)
+            return None
     key = os.environ.get("TYPESAFE_API_KEY") or keychain("jroute-typesafe")
     if not key:
         return None
@@ -226,6 +310,15 @@ def jev_ask(state, questions):
     except (HTTPError, URLError, OSError) as exc:
         print(f"  jev: unavailable ({type(exc).__name__}), using chain order", file=sys.stderr)
         return None
+
+
+def classify(task):
+    """One batched Jev call for the whole run, reduced to its answers map. Jev is optional:
+    a miss is not an error, it just means every chain starts at its cheapest eligible model."""
+    response = jev_ask(task, JEV_QUESTIONS)
+    if not response:
+        return None
+    return response.get("answers") or None
 
 
 # --------------------------------------------------------------------------------------
@@ -360,7 +453,9 @@ heading in that file. Report only actionable findings.""",
 }
 
 
-def run_stage(stage, task, route, config, dry_run=False, keep_panes=False, timeout_s=900):
+def run_stage(stage, task, route, config, keep_panes=False, focus=False, timeout_s=900):
+    """Run one stage in its own pane. The pane is closed on success and kept on failure,
+    so a failed stage can be read before deciding what to do with it."""
     plan_path = plan_path_for(task)
     brief = BRIEFS[stage].format(task=task, plan_path=plan_path,
                                  cap=config["plan_line_cap"])
@@ -368,15 +463,13 @@ def run_stage(stage, task, route, config, dry_run=False, keep_panes=False, timeo
         print(f"  blocked: {plan_path} does not exist, run the plan stage first")
         return None
 
-    if dry_run:
-        print(f"  [{stage}] {route}  (brief -> {plan_path})")
-        return {"stage": stage, "model": route, "dry_run": True}
-
     name = f"jroute-{stage}"
-    pane = herdr_json("pane", "split", "--current", "--direction", "right",
-                      "--cwd", os.getcwd(), "--no-focus")
-    pane_id = pane["result"]["pane"]["pane_id"]
-    owned = [pane_id]
+    split = ["pane", "split", "--current", "--direction", "right",
+             "--cwd", os.getcwd()]
+    if not focus:
+        split.append("--no-focus")
+    pane_id = herdr_json(*split)["result"]["pane"]["pane_id"]
+    keep = bool(keep_panes)
     try:
         kind, argv = launch_argv(stage, route, config["effort"].get(stage))
         started = herdr_json("agent", "start", name, "--kind", kind, "--pane", pane_id,
@@ -384,7 +477,7 @@ def run_stage(stage, task, route, config, dry_run=False, keep_panes=False, timeo
         session = started["result"]["agent"]["agent_session"].get("value")
         if not dismiss_dialogs(name, pane_id):
             print(f"  {stage}: a dialog is still up, leaving the pane open")
-            owned = []
+            keep = True
             return None
         herdr("agent", "prompt", name, brief, "--wait", "--timeout", str(timeout_s * 1000))
         usage = read_pi_usage(session) if kind == "pi" and session else None
@@ -393,22 +486,29 @@ def run_stage(stage, task, route, config, dry_run=False, keep_panes=False, timeo
         if usage:
             total = usage["total"]
             record["tokens_total"] = total
-            warn = config["token_warn_per_stage"]
-            flag = "  OVER BUDGET" if total > warn else ""
+            warn = (config.get("token_warn") or {}).get(stage)
+            over = warn and total > warn
             print(f"  {stage}: in {usage['input']} out {usage['output']} "
-                  f"cacheRead {usage['cache_read']} total {total}{flag}")
-            if total > warn:
+                  f"cacheRead {usage['cache_read']} total {total}"
+                  + ("  OVER BUDGET" if over else ""))
+            if over:
                 print(f"  warning: {stage} used {total} tokens, over the {warn} budget")
         if stage == "plan" and not plan_path.exists():
             print(f"  {stage}: finished but {plan_path} was not written")
-            owned = []
+            keep = True
+            return record
+        if stage == "plan" and "## acceptance criteria" not in plan_path.read_text():
+            print(f"  {stage}: {plan_path.name} has no '## acceptance criteria' section")
+            keep = True
             return record
         return record
+    except Exception:
+        keep = True  # never close a pane we may need to read after a failure
+        raise
     finally:
-        if not keep_panes:
-            for pane in owned:
-                subprocess.run(["herdr", "pane", "close", pane],
-                               capture_output=True, text=True)
+        if not keep:
+            subprocess.run(["herdr", "pane", "close", pane_id],
+                           capture_output=True, text=True)
 
 
 # --------------------------------------------------------------------------------------
@@ -424,8 +524,7 @@ def fmt_reset(seconds):
 
 def cmd_status(config, json_mode=False):
     snaps, errors = probe_all()
-    all_models = [m for chain in config["stages"].values() for m in chain]
-    ok_ids, excluded = eligible(snaps, config, all_models)
+    ok_ids, excluded = eligible(snaps, config, all_chain_models(config))
 
     if json_mode:
         serializable = {}
@@ -488,39 +587,62 @@ def cmd_status(config, json_mode=False):
             print(f"  {reason}: {', '.join(ids)}")
 
 
+def all_chain_models(config):
+    return [m for chain in config["stages"].values() for m in chain]
+
+
 def cmd_run(task, config, args):
     snaps, errors = probe_all()
     for name, err in errors.items():
         print(f"warn: {name} probe failed: {err}", file=sys.stderr)
 
+    answers = None if args.no_jev else classify(task)
+    start = jev_start_index(answers)
     stages = [args.stage] if args.stage else ["plan", "execute", "review"]
-    all_models = [m for chain in config["stages"].values() for m in chain]
-    ok_ids, excluded = eligible(snaps, config, all_models)
+    ok_ids, excluded = eligible(snaps, config, all_chain_models(config))
 
     print(f"jroute: {task}\n")
-    records = []
+    if answers:
+        fam = answers.get("family") or {}
+        comp = answers.get("complexity") or {}
+        cons = answers.get("consequence") or {}
+        print(f"  jev: {fam.get('choice')} (conf {fam.get('confidence')})  "
+              f"complexity {comp.get('score')} (conf {comp.get('confidence')})  "
+              f"consequence {cons.get('noul')}  -> chain offset {start}")
+    elif not args.no_jev:
+        print("  jev: unavailable, starting each chain at its cheapest eligible model")
+
+    records, ran_families, exit_code = [], [], 0
     for stage in stages:
-        route = resolve(stage, ok_ids, config)
+        # The plan chain is a fixed preference order, not a capability ladder: Astra first,
+        # Sol as fallback. Jev's complexity offset must not move it off that order.
+        offset = 0 if stage == "plan" else start
+        # review must not be the executor's family reviewing itself
+        skip = tuple(ran_families) if stage == "review" else ()
+        route = resolve(stage, ok_ids, config, offset, skip)
         if not route:
             print(f"  {stage}: NO ELIGIBLE MODEL")
-            for mid, reason in excluded:
-                if mid in config["stages"][stage]:
-                    print(f"      {mid}: {reason}")
+            for mid in config["stages"][stage]:
+                reason = dict(excluded).get(mid, "filtered by the review family constraint")
+                print(f"      {mid}: {reason}")
+            exit_code = 1
             break
-        if args.dry_run:
-            pass
+        chain = config["stages"][stage]
+        note = "" if route == chain[0] else f"  (chain offset {offset})"
         print(f"  {stage:8} -> {route}  ({config['effort'].get(stage, '')})  "
-              f"pane jroute-{stage}")
+              f"pane jroute-{stage}{note}")
         if args.dry_run:
             print(f"      brief -> {plan_path_for(task)}")
             continue
-        rec = run_stage(stage, task, route, config,
-                        keep_panes=args.keep_panes, timeout_s=args.timeout)
-        if rec:
-            records.append(rec)
-        else:
+        rec = run_stage(stage, task, route, config, keep_panes=args.keep_panes,
+                        focus=args.focus, timeout_s=args.timeout)
+        if not rec:
             print(f"  {stage}: aborted, stopping the pipeline")
+            exit_code = 1
             break
+        rec["jev"] = answers
+        records.append(rec)
+        ran_families.append(family_of(route))
 
     if records:
         HOME.mkdir(parents=True, exist_ok=True)
@@ -530,6 +652,7 @@ def cmd_run(task, config, args):
                 rec["ts"] = time.time()
                 fh.write(json.dumps(rec) + "\n")
         print(f"\nlogged {len(records)} stage(s) to {LOG_PATH}")
+    return exit_code
 
 
 def cmd_log(config, count):
@@ -556,6 +679,10 @@ def main():
     run.add_argument("--stage", choices=["plan", "execute", "review"])
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--keep-panes", action="store_true")
+    run.add_argument("--focus", action="store_true",
+                     help="move focus to each stage pane (default keeps your focus)")
+    run.add_argument("--no-jev", action="store_true",
+                     help="skip the Jev call and start every chain at its cheapest model")
     run.add_argument("--timeout", type=int, default=900, help="per-stage seconds")
 
     log = sub.add_parser("log", help="recent decisions")
@@ -569,7 +696,7 @@ def main():
     elif args.cmd == "run":
         if not args.dry_run and not inside_herdr():
             sys.exit("jroute run needs $HERDR_ENV=1; use --dry-run outside Herdr")
-        cmd_run(args.task, config, args)
+        sys.exit(cmd_run(args.task, config, args) or 0)
     elif args.cmd == "log":
         cmd_log(config, args.n)
 

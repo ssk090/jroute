@@ -16,7 +16,7 @@
     "review": [
       "opencode-go/glm-5.3",
       "opencode-go/qwen3.7-max",
-      "opencode-go/kimi-k3-high",
+      "opencode-go/kimi-k3",
       "cursor/gpt-5.6-sol-high"
     ]
   },
@@ -26,9 +26,20 @@
     "review": "medium"
   },
   "gates": {
-    "codex": { "primary_5h_max": 70, "secondary_7d_max": 85 },
-    "cursor": { "auto_bucket_max": 85, "api_bucket_max": 85, "total_max": 90 }
+    "codex": {
+      "primary_5h_max": 70,
+      "secondary_7d_max": 85
+    },
+    "cursor": {
+      "auto_bucket_max": 85,
+      "api_bucket_max": 85,
+      "total_max": 90
+    }
   },
-  "token_warn_per_stage": 150000,
-  "plan_line_cap": 120
+  "plan_line_cap": 120,
+  "token_warn": {
+    "plan": 400000,
+    "execute": 900000,
+    "review": 650000
+  }
 }

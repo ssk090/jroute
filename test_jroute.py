@@ -20,7 +20,8 @@ CONFIG = {
         "plan": ["openai-codex/gpt-6-astra", "openai-codex/gpt-5.6-sol",
                  "cursor/gpt-5.6-sol-high", "opencode-go/glm-5.3"],
         "execute": ["opencode-go/deepseek-v4.1-flash", "cursor/gpt-5.4-mini-medium"],
-        "review": ["opencode-go/glm-5.3", "cursor/claude-opus-5-high"],
+        "review": ["opencode-go/glm-5.3", "cursor/claude-opus-5-high",
+                   "opencode-go/qwen3.7-max"],
     },
     "effort": {"plan": "medium", "execute": "low", "review": "medium"},
     "gates": {"codex": {"primary_5h_max": 70, "secondary_7d_max": 85},
@@ -38,7 +39,9 @@ CURSOR_OK = {"provider": "cursor", "auto_used": 73.16, "api_used": 8.64,
              "total_used": 67.29, "auto_bucket": {"composer-2.5", "grok-4.5"},
              "enabled": True, "display_message": "You've hit your usage limit"}
 
-OPENCODE_OK = {"provider": "opencode-go", "kind": "flat", "models": ["glm-5.3"]}
+OPENCODE_OK = {"provider": "opencode-go", "kind": "flat",
+               "models": ["glm-5.3", "deepseek-v4.1-flash", "glm-5.3-flash",
+                          "qwen3.8-flash", "qwen3.7-max", "kimi-k3"]}
 
 ALL_OK = {"codex": CODEX_OK, "cursor": CURSOR_OK, "opencode-go": OPENCODE_OK}
 
@@ -136,6 +139,30 @@ class TestEligible(unittest.TestCase):
         ok, _ = jroute.eligible(ALL_OK, CONFIG, ["opencode-go/glm-5.3"])
         self.assertEqual(ok, ["opencode-go/glm-5.3"])
 
+    def test_opencode_go_model_absent_from_the_live_catalog_is_rejected(self):
+        """kimi-k3-high is a Cursor id, not an OpenCode Go one. A wrong id fails hard at
+        launch, so it must be caught by the gates rather than at runtime."""
+        ok, excluded = jroute.eligible(ALL_OK, CONFIG, ["opencode-go/kimi-k3-high"])
+        self.assertEqual(ok, [])
+        self.assertIn("catalog", excluded[0][1])
+
+    def test_opencode_go_catalog_unknown_leaves_the_model_eligible(self):
+        """A failed probe must not silently empty the free pool."""
+        ok, _ = jroute.eligible({"codex": CODEX_OK, "cursor": CURSOR_OK}, CONFIG,
+                                ["opencode-go/anything"])
+        self.assertEqual(ok, ["opencode-go/anything"])
+
+    def test_a_configured_model_missing_from_the_catalog_is_gated(self):
+        """Guards the config against typo'd or wrong-provider model ids: kimi-k3-high is a
+        Cursor id, and a wrong id fails hard at launch rather than at routing time."""
+        catalog = {"provider": "opencode-go", "kind": "flat", "models": ["glm-5.3"]}
+        snaps = dict(ALL_OK, **{"opencode-go": catalog})
+        ok, excluded = jroute.eligible(snaps, CONFIG, ["opencode-go/deepseek-v4.1-flash",
+                                                      "opencode-go/kimi-k3-high"])
+        self.assertEqual(ok, [])
+        self.assertEqual(len(excluded), 2)
+        self.assertTrue(all("catalog" in reason for _, reason in excluded))
+
     def test_unknown_provider_is_rejected(self):
         ok, excluded = jroute.eligible(ALL_OK, CONFIG, ["mistral/large"])
         self.assertEqual(ok, [])
@@ -163,6 +190,82 @@ class TestResolve(unittest.TestCase):
         ok = ["opencode-go/deepseek-v4.1-flash", "cursor/gpt-5.4-mini-medium"]
         self.assertEqual(jroute.resolve("execute", ok, CONFIG),
                          "opencode-go/deepseek-v4.1-flash")
+
+    def test_offset_moves_along_the_eligible_prefix_not_the_raw_chain(self):
+        """start=1 means 'one step up from the cheapest model I can actually use'."""
+        ok = ["opencode-go/glm-5.3-flash", "cursor/gpt-5.4-mini-medium"]
+        self.assertEqual(jroute.resolve("execute", ok, CONFIG, start=1),
+                         "cursor/gpt-5.4-mini-medium")
+
+    def test_offset_beyond_the_chain_clamps_to_the_strongest_eligible(self):
+        ok = ["opencode-go/deepseek-v4.1-flash", "cursor/gpt-5.4-mini-medium"]
+        self.assertEqual(jroute.resolve("execute", ok, CONFIG, start=99),
+                         "cursor/gpt-5.4-mini-medium")
+
+    def test_review_skips_the_executors_family(self):
+        """A glm executor must not be reviewed by glm, or the review is self-assessment."""
+        ok = ["opencode-go/glm-5.3", "opencode-go/qwen3.7-max"]
+        self.assertEqual(jroute.resolve("review", ok, CONFIG, exclude_families=("glm",)),
+                         "opencode-go/qwen3.7-max")
+
+    def test_review_falls_through_when_every_review_model_is_the_executors_family(self):
+        ok = ["opencode-go/glm-5.3"]
+        self.assertIsNone(jroute.resolve("review", ok, CONFIG, exclude_families=("glm",)))
+
+
+class TestFamilyOf(unittest.TestCase):
+    def test_extracts_the_family_prefix(self):
+        for model, family in [("opencode-go/deepseek-v4.1-flash", "deepseek"),
+                              ("opencode-go/glm-5.3-flash", "glm"),
+                              ("opencode-go/qwen3.8-flash", "qwen3"),
+                              ("openai-codex/gpt-6-astra", "gpt"),
+                              ("cursor/gpt-5.6-sol-high", "gpt"),
+                              ("opencode-go/kimi-k3", "kimi")]:
+            self.assertEqual(jroute.family_of(model), family)
+
+    def test_treats_different_gpt_models_as_one_family(self):
+        self.assertEqual(jroute.family_of("openai-codex/gpt-6-astra"),
+                         jroute.family_of("cursor/gpt-5.6-sol-high"))
+
+
+class TestJevStartIndex(unittest.TestCase):
+    def answers(self, score, confidence=0.9, consequence=0.1):
+        return {"complexity": {"score": score, "confidence": confidence},
+                "consequence": {"noul": consequence}}
+
+    def test_routine_work_starts_at_the_cheapest_model(self):
+        self.assertEqual(jroute.jev_start_index(self.answers(1.0)), 0)
+
+    def test_moderate_work_starts_one_step_up(self):
+        self.assertEqual(jroute.jev_start_index(self.answers(2.0)), 1)
+
+    def test_hard_work_skips_to_the_strong_end(self):
+        self.assertEqual(jroute.jev_start_index(self.answers(3.2)), 2)
+
+    def test_low_confidence_rounds_complexity_up_not_down(self):
+        """Under-powering costs a failed attempt plus the escalation, so it never rounds down."""
+        self.assertEqual(jroute.jev_start_index(self.answers(1.0, confidence=0.4)), 1)
+
+    def test_high_consequence_skips_to_the_strong_end(self):
+        self.assertEqual(jroute.jev_start_index(self.answers(1.0, consequence=0.9)), 2)
+
+    def test_missing_answers_default_to_the_cheapest_model(self):
+        self.assertEqual(jroute.jev_start_index(None), 0)
+        self.assertEqual(jroute.jev_start_index({}), 0)
+        self.assertEqual(jroute.jev_start_index({"complexity": {}}), 0)
+
+    def test_a_hard_task_would_offset_astra_off_the_plan_chain_without_the_pin(self):
+        """gpt-6-astra leads the plan chain by explicit instruction, so cmd_run pins the plan
+        offset to zero. This asserts both halves: the offset would move it, and zero does not.
+        """
+        ok = ["openai-codex/gpt-6-astra", "openai-codex/gpt-5.6-sol",
+              "cursor/gpt-5.6-sol-high"]
+        hard = jroute.jev_start_index(self.answers(4.0, consequence=0.95))
+        self.assertEqual(hard, 2)
+        self.assertEqual(jroute.resolve("plan", ok, CONFIG, start=0),
+                         "openai-codex/gpt-6-astra", "pinned offset keeps Astra planning")
+        self.assertEqual(jroute.resolve("plan", ok, CONFIG, start=hard),
+                         "cursor/gpt-5.6-sol-high", "unpinned, the offset would take it away")
 
 
 class TestParsePiUsage(unittest.TestCase):
@@ -231,7 +334,7 @@ EXPECTED_TEXT_ALL_OK = (
     "codex        OK        5h 10% (reset 4h41m)  7d 56% (reset 45h37m)\n"
     "cursor       OK        auto 73.2%  api 8.6%  total 67.3%\n"
     "             auto bucket contains 2 models (composer-2.5, grok-4.5 ladders)\n"
-    "opencode-go  FLAT      1 models, no usage endpoint exists\n"
+    "opencode-go  FLAT      6 models, no usage endpoint exists\n"
     "\n"
     "stage routes\n"
     "  plan     -> openai-codex/gpt-6-astra  (medium)\n"
@@ -248,7 +351,7 @@ EXPECTED_TEXT_PROBE_ERROR = (
     "codex        ERROR    RuntimeError: boom\n"
     "cursor       OK        auto 73.2%  api 8.6%  total 67.3%\n"
     "             auto bucket contains 2 models (composer-2.5, grok-4.5 ladders)\n"
-    "opencode-go  FLAT      1 models, no usage endpoint exists\n"
+    "opencode-go  FLAT      6 models, no usage endpoint exists\n"
     "\n"
     "stage routes\n"
     "  plan     -> cursor/gpt-5.6-sol-high  (medium)\n"
