@@ -1,0 +1,34 @@
+{
+  "stages": {
+    "plan": [
+      "openai-codex/gpt-6-astra",
+      "openai-codex/gpt-5.6-sol",
+      "cursor/gpt-5.6-sol-high",
+      "opencode-go/glm-5.3"
+    ],
+    "execute": [
+      "opencode-go/deepseek-v4.1-flash",
+      "opencode-go/glm-5.3-flash",
+      "opencode-go/qwen3.8-flash",
+      "cursor/gpt-5.4-mini-medium",
+      "openai-codex/gpt-5.6-luna"
+    ],
+    "review": [
+      "opencode-go/glm-5.3",
+      "opencode-go/qwen3.7-max",
+      "opencode-go/kimi-k3-high",
+      "cursor/gpt-5.6-sol-high"
+    ]
+  },
+  "effort": {
+    "plan": "medium",
+    "execute": "low",
+    "review": "medium"
+  },
+  "gates": {
+    "codex": { "primary_5h_max": 70, "secondary_7d_max": 85 },
+    "cursor": { "auto_bucket_max": 85, "api_bucket_max": 85, "total_max": 90 }
+  },
+  "token_warn_per_stage": 150000,
+  "plan_line_cap": 120
+}
