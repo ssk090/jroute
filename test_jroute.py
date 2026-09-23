@@ -19,20 +19,23 @@ import jroute
 
 CONFIG = {
     "stages": {
+        "answer": ["opencode-go/deepseek-v4.1-flash", "opencode-go/glm-5.3-flash",
+                   "opencode-go/qwen3.8-flash", "openai-codex/gpt-5.6-luna"],
         "plan": ["openai-codex/gpt-6-astra", "openai-codex/gpt-5.6-sol",
                  "cursor/gpt-5.6-sol-high", "opencode-go/glm-5.3"],
         "execute": ["opencode-go/deepseek-v4.1-flash", "cursor/gpt-5.4-mini-medium"],
         "review": ["opencode-go/glm-5.3", "cursor/claude-opus-5-high",
                    "opencode-go/qwen3.7-max"],
     },
-    "effort": {"plan": "medium", "execute": "low", "review": "medium"},
+    "effort": {"answer": "low", "plan": "medium", "execute": "low", "review": "medium"},
     "shape": {"question_threshold": 0.6, "design_threshold": 0.5,
               "review_consequence": 0.7, "review_complexity": 3,
               "default": ["plan", "execute"]},
-    "skills": {"plan": ["to-spec"], "execute": ["implement"], "review": ["code-review"]},
+    "skills": {"plan": ["to-spec", "to-tickets"], "execute": ["implement", "tdd"],
+               "review": ["code-review"]},
     "gates": {"codex": {"primary_5h_max": 70, "secondary_7d_max": 85},
               "cursor": {"auto_bucket_max": 85, "api_bucket_max": 85, "total_max": 90}},
-    "token_warn_per_stage": 150000,
+    "token_warn": {"answer": 60000, "plan": 500000, "execute": 900000, "review": 650000},
     "plan_line_cap": 120,
 }
 
@@ -343,6 +346,7 @@ EXPECTED_TEXT_ALL_OK = (
     "opencode-go  FLAT      6 models, no usage endpoint exists\n"
     "\n"
     "stage routes\n"
+    "  answer   -> opencode-go/deepseek-v4.1-flash  (low)\n"
     "  plan     -> openai-codex/gpt-6-astra  (medium)\n"
     "  execute  -> opencode-go/deepseek-v4.1-flash  (low)\n"
     "  review   -> opencode-go/glm-5.3  (medium)\n"
@@ -360,12 +364,13 @@ EXPECTED_TEXT_PROBE_ERROR = (
     "opencode-go  FLAT      6 models, no usage endpoint exists\n"
     "\n"
     "stage routes\n"
+    "  answer   -> opencode-go/deepseek-v4.1-flash  (low)\n"
     "  plan     -> cursor/gpt-5.6-sol-high  (medium)\n"
     "  execute  -> opencode-go/deepseek-v4.1-flash  (low)\n"
     "  review   -> opencode-go/glm-5.3  (medium)\n"
     "\n"
     "exclusions\n"
-    "  codex quota unknown (probe failed): openai-codex/gpt-6-astra, openai-codex/gpt-5.6-sol\n"
+    "  codex quota unknown (probe failed): openai-codex/gpt-5.6-luna, openai-codex/gpt-6-astra, openai-codex/gpt-5.6-sol\n"
     "  anthropic model, excluded by policy: cursor/claude-opus-5-high\n"
 )
 
@@ -438,6 +443,7 @@ class TestStatusJson(unittest.TestCase):
     def test_routes_map_every_stage_to_model_and_effort(self):
         payload, _ = status_json(ALL_OK, {})
         self.assertEqual(payload["routes"], {
+            "answer": {"model": "opencode-go/deepseek-v4.1-flash", "effort": "low"},
             "plan": {"model": "openai-codex/gpt-6-astra", "effort": "medium"},
             "execute": {"model": "opencode-go/deepseek-v4.1-flash", "effort": "low"},
             "review": {"model": "opencode-go/glm-5.3", "effort": "medium"},
@@ -469,6 +475,7 @@ class TestStatusJson(unittest.TestCase):
         self.assertEqual(payload["snapshots"], {})
         self.assertEqual(payload["errors"], errors)
         self.assertEqual(payload["routes"], {
+            "answer": {"model": "opencode-go/deepseek-v4.1-flash", "effort": "low"},
             "plan": {"model": "opencode-go/glm-5.3", "effort": "medium"},
             "execute": {"model": "opencode-go/deepseek-v4.1-flash", "effort": "low"},
             "review": {"model": "opencode-go/glm-5.3", "effort": "medium"},
@@ -863,20 +870,127 @@ class TestStreamRendering(unittest.TestCase):
         self.assertEqual(stream.summary(), "")
 
 
-class TestLaunchArgv(unittest.TestCase):
+class TestProviderArgv(unittest.TestCase):
+    """One table serves both launch forms. Two adapter shapes really exist, so the seam is
+    earned: pi carries the effort flag, cursor-agent has no effort flag at all."""
+
     def test_pi_gets_the_effort_flag_for_codex_and_opencode(self):
-        kind, argv = jroute.launch_argv("plan", "openai-codex/gpt-6-astra", "medium")
+        kind, argv = jroute.provider_argv("openai-codex/gpt-6-astra", "medium")
         self.assertEqual(kind, "pi")
         self.assertEqual(argv, ["--model", "openai-codex/gpt-6-astra", "--thinking", "medium"])
 
     def test_cursor_has_no_effort_flag_because_it_is_baked_into_the_model_id(self):
-        kind, argv = jroute.launch_argv("plan", "cursor/gpt-5.6-sol-high", "medium")
+        kind, argv = jroute.provider_argv("cursor/gpt-5.6-sol-high", "medium")
         self.assertEqual(kind, "cursor-agent")
         self.assertEqual(argv, ["--model", "gpt-5.6-sol-high"])
 
     def test_unknown_provider_raises_rather_than_launching_something_wrong(self):
         with self.assertRaises(RuntimeError):
-            jroute.launch_argv("plan", "mistral/large", "medium")
+            jroute.provider_argv("mistral/large", "medium")
+
+    def test_both_providers_are_covered_so_no_chain_entry_is_unlaunchable(self):
+        for model in ("openai-codex/gpt-6-astra", "opencode-go/glm-5.3",
+                      "cursor/gpt-5.4-mini-medium"):
+            kind, argv = jroute.provider_argv(model, "low")
+            self.assertIn(kind, ("pi", "cursor-agent"))
+            self.assertIn("--model", argv)
+
+
+class TestStageGate(unittest.TestCase):
+    """A stage is done when its artifact exists, not when the agent stops talking. One home
+    for that policy, so all three stages gate the same way."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def plan(self, text):
+        path = self.tmp / "p.md"
+        path.write_text(text)
+        return path
+
+    def test_plan_fails_when_the_artifact_is_missing(self):
+        passed, reason = jroute.stage_gate("plan", self.tmp / "absent.md")
+        self.assertFalse(passed)
+        self.assertIn("was not written", reason)
+
+    def test_plan_fails_without_acceptance_criteria(self):
+        passed, reason = jroute.stage_gate("plan", self.plan("## files to change\nnone\n"))
+        self.assertFalse(passed)
+        self.assertIn("acceptance criteria", reason)
+
+    def test_plan_passes_with_acceptance_criteria(self):
+        passed, _ = jroute.stage_gate("plan", self.plan("## acceptance criteria\nit works\n"))
+        self.assertTrue(passed)
+
+    def test_execute_fails_when_no_commit_was_made(self):
+        with patch.object(jroute, "git_head", return_value="abc123"):
+            passed, reason = jroute.stage_gate("execute", self.plan("x"), before_head="abc123")
+        self.assertFalse(passed)
+        self.assertIn("no new commit", reason)
+
+    def test_execute_passes_when_head_advanced(self):
+        with patch.object(jroute, "git_head", return_value="def456"):
+            passed, _ = jroute.stage_gate("execute", self.plan("x"), before_head="abc123")
+        self.assertTrue(passed)
+
+    def test_execute_passes_when_the_head_was_never_recorded(self):
+        """Outside a git repo there is nothing to compare, so the gate stays out of the way."""
+        passed, _ = jroute.stage_gate("execute", self.plan("x"), before_head=None)
+        self.assertTrue(passed)
+
+    def test_review_fails_without_findings_appended(self):
+        passed, reason = jroute.stage_gate("review", self.plan("## acceptance criteria\nx\n"))
+        self.assertFalse(passed)
+        self.assertIn("review findings", reason)
+
+    def test_review_passes_with_findings_appended(self):
+        passed, _ = jroute.stage_gate("review", self.plan("## review findings\nnothing\n"))
+        self.assertTrue(passed)
+
+    def test_an_unknown_stage_is_not_gated(self):
+        passed, _ = jroute.stage_gate("answer", self.plan(""))
+        self.assertTrue(passed)
+
+
+class TestConfigParity(unittest.TestCase):
+    """The test fixture mirrors config.json, and had already drifted once: it kept a
+    superseded token_warn_per_stage key, so the warn path had no coverage at all."""
+
+    def setUp(self):
+        self.real = json.loads(jroute.CONFIG_PATH.read_text())
+
+    def test_token_warn_is_per_stage_in_both(self):
+        self.assertIn("token_warn", self.real)
+        self.assertIn("token_warn", CONFIG)
+        self.assertNotIn("token_warn_per_stage", CONFIG)
+        self.assertNotIn("token_warn_per_stage", self.real)
+
+    def test_fixture_covers_every_stage_the_real_config_has(self):
+        self.assertEqual(set(CONFIG["stages"]), set(self.real["stages"]))
+
+    def test_fixture_matches_the_real_gate_thresholds(self):
+        self.assertEqual(CONFIG["gates"], self.real["gates"])
+
+    def test_fixture_matches_the_real_skill_mapping(self):
+        self.assertEqual(CONFIG["skills"], self.real["skills"])
+
+    def test_fixture_matches_the_real_shape_policy(self):
+        self.assertEqual(CONFIG["shape"], self.real["shape"])
+
+    def test_every_stage_has_a_warn_budget_in_both(self):
+        for config in (CONFIG, self.real):
+            for stage in config["stages"]:
+                self.assertIn(stage, config["token_warn"], f"{stage} has no budget")
+
+    def test_every_configured_skill_exists_on_disk(self):
+        """A typo'd skill name would fail silently, since the brief is just prose."""
+        root = Path.home() / ".pi" / "agent" / "skills"
+        if not root.exists():
+            self.skipTest("no skills directory on this machine")
+        for stage, names in self.real["skills"].items():
+            for name in names:
+                self.assertTrue((root / name / "SKILL.md").exists(),
+                                f"skills.{stage} names {name!r}, which is not installed")
 
 
 if __name__ == "__main__":

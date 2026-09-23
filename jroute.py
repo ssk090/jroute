@@ -12,6 +12,7 @@ and are covered by test_jroute.py. Everything else is a thin wrapper over HTTP o
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -228,6 +229,16 @@ def noul(answers, name):
     return value if isinstance(value, (int, float)) else 0.0
 
 
+def effective_complexity(answers):
+    """Jev's complexity, rounded up when it is unsure. One home for that rule: under-powering
+    a task costs a failed attempt plus the escalation, so it never rounds down."""
+    answer = answers.get("complexity") or {}
+    score = answer.get("score")
+    if not isinstance(score, (int, float)):
+        return None
+    return score + (1 if (answer.get("confidence") or 0) < 0.6 else 0)
+
+
 def jev_shape(answers, config):
     """Jev judges the task; code decides the pipeline. Returns the stages to run.
 
@@ -238,17 +249,13 @@ def jev_shape(answers, config):
     if not answers:
         return tuple(policy.get("default") or ("plan", "execute"))
 
-    complexity = (answers.get("complexity") or {}).get("score")
-    confidence = (answers.get("complexity") or {}).get("confidence") or 0
+    complexity = effective_complexity(answers)
     consequence = noul(answers, "consequence")
-    if isinstance(complexity, (int, float)) and confidence < 0.6:
-        complexity += 1  # under-powering costs a failed attempt, so never round down
 
     if noul(answers, "is_question") > policy.get("question_threshold", 0.6):
         return ("answer",)
 
-    hard = (isinstance(complexity, (int, float))
-            and complexity >= policy.get("review_complexity", 3))
+    hard = isinstance(complexity, (int, float)) and complexity >= policy.get("review_complexity", 3)
     if hard or consequence > policy.get("review_consequence", 0.7):
         return ("plan", "execute", "review")
 
@@ -260,23 +267,16 @@ def jev_shape(answers, config):
 
 
 def jev_start_index(answers):
-    """Map Jev's judgment onto a chain offset. Not a model choice, a starting point.
-
-    Deliberately conservative in one direction only: under-powering a task costs a failed
-    attempt plus the escalation, so low confidence rounds complexity up, never down.
-    """
+    """Map Jev's judgment onto a chain offset. Not a model choice, a starting point."""
     if not answers:
         return 0
-    complexity = answers.get("complexity") or {}
-    score = complexity.get("score")
-    if score is None:
+    complexity = effective_complexity(answers)
+    if complexity is None:
         return 0
-    confidence = complexity.get("confidence") or 0
-    consequence = (answers.get("consequence") or {}).get("noul") or 0
-    effective = score + (1 if confidence < 0.6 else 0)
-    if effective >= 3 or consequence > 0.7:
+    consequence = noul(answers, "consequence")
+    if complexity >= 3 or consequence > 0.7:
         return 2
-    if effective >= 2:
+    if complexity >= 2:
         return 1
     return 0
 
@@ -287,7 +287,6 @@ def jev_start_index(answers):
 
 def redact(text):
     """Jev state leaves the machine. Strip anything credential-shaped, or refuse."""
-    from re import sub
     patterns = [
         r"sk-[A-Za-z0-9_\-]{8,}", r"gh[pousr]_[A-Za-z0-9]{8,}", r"github_pat_[A-Za-z0-9_]+",
         r"AKIA[0-9A-Z]{16}", r"AIza[A-Za-z0-9_\-]{20,}", r"xox[baprs]-[A-Za-z0-9\-]{10,}",
@@ -295,8 +294,8 @@ def redact(text):
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
     ]
     out = text
-    for p in patterns:
-        out = sub(p, "<redacted>", out, flags=re.S)
+    for pattern in patterns:
+        out = re.sub(pattern, "<redacted>", out, flags=re.S)
     return out
 
 
@@ -332,13 +331,6 @@ JEV_QUESTIONS = {
         "type": "noul",
         "instructions": "Does this require design or specification decisions before code "
                         "can be written, or is the approach already determined?",
-    },
-    "min_effort": {
-        "type": "choice",
-        "instructions": "What is the minimum reasoning effort likely to be sufficient?",
-        "criteria": {"low": "bounded, well-understood change",
-                     "medium": "some judgment required",
-                     "high": "subtle, high-consequence, or deeply uncertain"},
     },
 }
 
@@ -463,17 +455,20 @@ def inside_herdr():
     return os.environ.get("HERDR_ENV") == "1"
 
 
-def launch_argv(stage, model, effort):
-    """pi carries the effort flag for every provider it serves, which is the main token
-    lever. cursor-agent has no effort flag, so effort lives in the model id."""
-    provider, name = model.split("/", 1)
+def provider_argv(route, effort, headless=False):
+    """One home for the provider-to-command mapping. Two adapter shapes really exist, pi for
+    Codex and OpenCode Go and cursor-agent for Cursor, so the seam is earned rather than
+    hypothetical. Headless is the print-mode form of the same launch: pi carries the effort
+    flag in both forms, which is the main token lever."""
+    provider, name = route.split("/", 1)
     if provider in ("openai-codex", "opencode-go"):
-        argv = ["--model", model]
+        argv = ["--model", route]
         if effort:
             argv += ["--thinking", effort]
-        return "pi", argv
+        return "pi", (["pi", "-p", "--no-session"] + argv if headless else argv)
     if provider == "cursor":
-        return "cursor-agent", ["--model", name]
+        argv = ["--model", name]
+        return "cursor-agent", (["cursor-agent", "-p"] + argv if headless else argv)
     raise RuntimeError(f"no launcher for provider {provider!r}")
 
 
@@ -555,6 +550,35 @@ def brief_for(stage, task, config, plan_path, has_plan):
     return brief
 
 
+def git_head():
+    proc = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def stage_gate(stage, plan_path, before_head=None):
+    """A stage is done when its artifact exists, not when the agent stops talking.
+
+    One home for that policy, so all three stages are gated the same way. Returns
+    (passed, reason). Without this the pipeline marches on from an empty plan.
+    """
+    if stage == "plan":
+        if not plan_path.exists():
+            return False, f"{plan_path.name} was not written"
+        if "## acceptance criteria" not in plan_path.read_text():
+            return False, f"{plan_path.name} has no '## acceptance criteria' section"
+        return True, ""
+    if stage == "execute":
+        after = git_head()
+        if before_head and after and after == before_head:
+            return False, "no new commit, so the change was never committed"
+        return True, ""
+    if stage == "review":
+        if "## review findings" not in plan_path.read_text():
+            return False, f"no '## review findings' section appended to {plan_path.name}"
+        return True, ""
+    return True, ""
+
+
 def run_stage(stage, task, route, config, keep_panes=False, focus=False, timeout_s=900,
               has_plan=True):
     """Run one stage in its own pane. The pane is closed on success and kept on failure,
@@ -564,6 +588,7 @@ def run_stage(stage, task, route, config, keep_panes=False, focus=False, timeout
     if stage != "plan" and has_plan and not plan_path.exists():
         print(f"  blocked: {plan_path} does not exist, run the plan stage first")
         return None
+    before_head = git_head() if stage == "execute" else None
 
     name = f"jroute-{stage}"
     split = ["pane", "split", "--current", "--direction", "right",
@@ -573,7 +598,7 @@ def run_stage(stage, task, route, config, keep_panes=False, focus=False, timeout
     pane_id = herdr_json(*split)["result"]["pane"]["pane_id"]
     keep = bool(keep_panes)
     try:
-        kind, argv = launch_argv(stage, route, config["effort"].get(stage))
+        kind, argv = provider_argv(route, config["effort"].get(stage))
         started = herdr_json("agent", "start", name, "--kind", kind, "--pane", pane_id,
                              "--", *argv)
         session = started["result"]["agent"]["agent_session"].get("value")
@@ -603,10 +628,11 @@ def run_stage(stage, task, route, config, keep_panes=False, focus=False, timeout
             print(f"  {stage}: finished but {plan_path} was not written")
             keep = True
             return record
-        if stage == "plan" and "## acceptance criteria" not in plan_path.read_text():
-            print(f"  {stage}: {plan_path.name} has no '## acceptance criteria' section")
+        passed, reason = stage_gate(stage, plan_path, before_head)
+        if not passed:
+            print(f"  {stage}: gate failed: {reason}")
             keep = True
-            return record
+            return None
         return record
     except Exception:
         keep = True  # never close a pane we may need to read after a failure
@@ -617,7 +643,7 @@ def run_stage(stage, task, route, config, keep_panes=False, focus=False, timeout
                            capture_output=True, text=True)
 
 
-def format_elapsed(seconds, width=60):
+def format_elapsed(seconds):
     """mm:ss, used for every live progress line."""
     seconds = max(0, int(seconds))
     return f"{seconds // 60}:{seconds % 60:02d}"
@@ -628,13 +654,16 @@ CHROME = ("esc interrupt", "escape interrupt", "(auto)", "Ctrl+P", "press ctrl",
           "└", "┘", "┌", "┐", "─", "▄", "▀")
 
 
+PROGRESS_WIDTH = 110
+
+
 class Spinner:
     """A live progress line. Appears only after `delay` seconds, so a fast call shows
     nothing, and only on a TTY, so piped output stays clean."""
 
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-    def __init__(self, label, delay=0.8, enabled=None, pad=110):
+    def __init__(self, label, delay=0.8, enabled=None, pad=PROGRESS_WIDTH):
         self.label = label
         self.delay = delay
         self.enabled = sys.stdout.isatty() if enabled is None else enabled
@@ -825,7 +854,7 @@ class SessionStream:
                 self.emit(kind, text)
 
     def emit(self, kind, text):
-        print("\r" + " " * 110 + "\r", end="", flush=True)
+        print("\r" + " " * PROGRESS_WIDTH + "\r", end="", flush=True)
         print(f"{EVENT_PREFIX.get(kind, '  ')}{text}", flush=True)
 
     def summary(self):
@@ -896,8 +925,9 @@ def cmd_status(config, json_mode=False, full=False):
     print("jroute status\n")
     codex = snaps.get("codex")
     if codex:
-        codex_ok, codex_excluded = eligible(snaps, config, ["openai-codex/gpt-6-astra"])
-        print(f"codex        {'OK       ' if codex_ok else 'GATED    '} "
+        codex_excluded = [reason for mid, reason in excluded
+                          if mid.startswith("openai-codex/")]
+        print(f"codex        {'GATED    ' if codex_excluded else 'OK       '} "
               f"5h {codex['primary_used']:.0f}% (reset {fmt_reset(codex['reset_primary_s'])})  "
               f"7d {codex['secondary_used']:.0f}% (reset {fmt_reset(codex['reset_secondary_s'])})")
         for mid, reason in codex_excluded:
@@ -938,16 +968,7 @@ def cmd_status(config, json_mode=False, full=False):
 
 
 def answer_argv(route, effort):
-    """Headless form of the same launch: pi's print mode answers and exits."""
-    provider, name = route.split("/", 1)
-    if provider in ("openai-codex", "opencode-go"):
-        argv = ["pi", "-p", "--no-session", "--model", route]
-        if effort:
-            argv += ["--thinking", effort]
-        return argv
-    if provider == "cursor":
-        return ["cursor-agent", "-p", "--model", name]
-    raise RuntimeError(f"no headless launcher for provider {provider!r}")
+    return provider_argv(route, effort, headless=True)[1]
 
 
 BANNER = ("[pi-web-access]", "[Context]", "[Skills]", "[Prompts]", "[Extensions]")
@@ -995,7 +1016,7 @@ def cmd_run(task, config, args):
     for name, err in errors.items():
         print(f"warn: {name} probe failed: {err}", file=sys.stderr)
 
-    answers = None if args.no_jev else classify(task)
+    answers = None if (args.no_jev or args.stage) else classify(task)
     start = jev_start_index(answers)
     ok_ids, excluded = eligible(snaps, config, all_chain_models(config))
 
@@ -1007,7 +1028,7 @@ def cmd_run(task, config, args):
               f"question {noul(answers, 'is_question'):.2f}  "
               f"needs_design {noul(answers, 'needs_design'):.2f}  "
               f"consequence {noul(answers, 'consequence'):.2f}")
-    elif not args.no_jev:
+    elif not args.no_jev and not args.stage:
         print("  jev: unavailable, starting each chain at its cheapest eligible model")
 
     shape = (args.stage,) if args.stage else jev_shape(answers, config)
@@ -1048,35 +1069,38 @@ def cmd_run(task, config, args):
             continue
         rec = run_stage(stage, task, route, config, keep_panes=args.keep_panes,
                         focus=args.focus, timeout_s=args.timeout,
-                        has_plan="plan" in shape)
+                        has_plan=("plan" in shape) or stage == "review")
         if not rec:
             print(f"  {stage}: aborted, stopping the pipeline")
             exit_code = 1
             break
         rec["jev"] = answers
+        rec["effort"] = config["effort"].get(stage, "")
+        rec["exclusions"] = [{"model": mid, "reason": reason} for mid, reason in excluded]
         records.append(rec)
         ran_families.append(family_of(route))
 
     if records:
         HOME.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(task.encode()).hexdigest()[:16]
         with LOG_PATH.open("a") as fh:
             for rec in records:
-                rec["task"] = task
+                rec["task_sha256"] = digest
                 rec["ts"] = time.time()
                 fh.write(json.dumps(rec) + "\n")
         print(f"\nlogged {len(records)} stage(s) to {LOG_PATH}")
     return exit_code
 
 
-def cmd_log(config, count):
+def cmd_log(count):
     if not LOG_PATH.exists():
         print("no decisions logged yet")
         return
     for line in LOG_PATH.read_text().splitlines()[-count:]:
         rec = json.loads(line)
-        usage = rec.get("usage") or {}
         print(f"{rec.get('stage'):8} {rec.get('model'):38} "
-              f"total {rec.get('tokens_total', '-'):>8} {rec.get('plan', '')}")
+              f"{rec.get('effort', '-'):6} total {rec.get('tokens_total', '-'):>8} "
+              f"{rec.get('plan', '')}")
 
 
 def main():
@@ -1120,7 +1144,7 @@ def main():
             sys.exit("jroute run needs $HERDR_ENV=1; use --dry-run outside Herdr")
         sys.exit(cmd_run(args.task, config, args) or 0)
     elif args.cmd == "log":
-        cmd_log(config, args.n)
+        cmd_log(args.n)
 
 
 if __name__ == "__main__":

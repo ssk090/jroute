@@ -508,6 +508,58 @@ Not yet observed live: whether naming `to-spec` and `to-tickets` in the plan bri
 
 ---
 
+### Deviations and gaps, declared after review
+
+A two-axis review of the whole implementation (Standards on kimi-k3, Spec on qwen3.8-max, in
+separate panes) found these. Each is either fixed or declared; none is silent.
+
+**Fixed as a result:**
+
+- **The plan gate did not gate.** It returned the record on a failed artifact check, so `cmd_run`
+  logged the stage as done and marched on, which is the exact failure section 7.4 warns about.
+  `stage_gate` now returns `None` and the pipeline stops.
+- **Execute and review had no gates at all.** Section 7.4 asks for green tests and appended
+  findings. `stage_gate` now checks a new commit for execute and a `## review findings`
+  section for review, so all three stages gate the same way from one place.
+- **`--stage review` skipped the plan-exists check**, because `has_plan` was derived from the
+  shape alone while the review brief references the plan path.
+- **Jev was called even with `--stage` given**, contradicting section 9.7. An explicit stage
+  determines the route, so the call is skipped.
+- **The decision log stored the task verbatim** and omitted effort, exclusions, and quota.
+  It now stores a `task_sha256` plus `effort` and `exclusions`.
+- **The test fixture had drifted from config.json**, keeping a superseded
+  `token_warn_per_stage` key, so the warn path had no coverage. `TestConfigParity` now asserts
+the fixture matches the real gate thresholds, shape policy, skill mapping, and per-stage
+budgets, and that every configured skill name is actually installed.
+
+**Declared, not fixed:**
+
+| Deviation | Why |
+|---|---|
+| The plan chain reaches Cursor before OpenCode Go when Codex is gated | The instruction was "route to OpenCode Go". The chain instead uses `cursor/gpt-5.6-sol-high`, the same model family as the fallback, from a pool that is 91 percent idle, and keeps OpenCode Go as the last link. Execute and review do honour the instruction directly. |
+| Jev offsets the execute and review chains upward for hard tasks | Section 8 says start cheap and escalate on evidence. Offsetting pre-empts one wasted attempt on a task Jev rates as hard. The plan chain stays pinned; this is a conscious departure from section 8's literal wording. |
+| Token budgets and live streaming are pi-only | Usage is read from pi's session JSONL and the stream parses its schema, so a Cursor-routed stage gets neither a budget warning nor a stream. Cursor stages work; they are just silent. |
+| A Jev miss defaults to `plan -> execute` | A question pays for a plan when Jev cannot answer. The alternative under-powers real work, so it fails conservative. |
+| No reset-proximity rule | Section 7.8's "do not downgrade when a reset is close" is unimplemented. `status` prints reset times and nothing consults them. |
+| No capability table or weights | Section 11 lists them in config. Chain order is the capability ranking instead, which is simpler and explainable. |
+| Execute pane is named `jroute-execute` | Section 2 wrote `jroute-exec`. `jroute-{stage}` is one line of code; the spec was the thing that was wrong. |
+| `status --version` and the `HERDR_ENV=1` guard are undocumented in section 11 | Both exist, both are useful, neither was specified. |
+| The Cursor auto bucket is gated at 85 percent, not excluded | Section 8 says "avoid". The gate admits a model below 85 percent. Latent rather than live: no chain currently names an auto-bucket model. |
+| Cursor model ids are not catalog-validated | Only OpenCode Go ids are checked against the live catalog. A typo in a Cursor id still fails at launch. |
+
+**Modularity verdict (reviewed, then accepted).** The reviewer argued from the deletion test
+that the nine banner-delimited sections are already real seams, that callers and tests cross
+them at the same functional interface, and that extracting files would add import friction
+rather than depth. Recommendation: keep one file, and extract only when a second consumer of
+the probes or the routing appears. Accepted, because the deletion test is the right test and
+it does not support splitting yet. What was fixed instead is the duplication inside those
+seams: one provider-to-command table now serves both the pane and headless launch forms, one
+`effective_complexity` now holds the confidence-rounding rule that was written twice and had
+already gone inconsistent, one `stage_gate` holds the completion policy, and the unused
+`min_effort` Jev question was deleted rather than left paying tokens for nothing.
+
+---
+
 ## 15. First three actions
 
 1. Get a Jev key and confirm one `systemone` call.
