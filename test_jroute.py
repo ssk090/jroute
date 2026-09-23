@@ -658,10 +658,23 @@ class TestProgress(unittest.TestCase):
     def test_chrome_list_covers_the_observed_footers(self):
         footers = ["↑16k ↓5 $0.161 (sub) 5.9%/272k (auto)  (openai-codex) gpt-6-astra",
                    "escape interrupt · ctrl+c/ctrl+d clear/exit · / commands",
-                   "─────────────────────────────────────────"]
+                   "─────────────────────────────────────────",
+                   "● 🐴 ponytail: ⚡ FULL"]
         for footer in footers:
             self.assertTrue(any(m in footer for m in jroute.CHROME),
                             f"footer should be filtered: {footer!r}")
+
+    def test_activity_picks_the_agents_real_line_not_the_status_bar(self):
+        """The status bar sits at the bottom, so a naive last-line read reports it forever."""
+        screen = "  → read jroute.py\n  Running the test suite...\n● 🐴 ponytail: ⚡ FULL\n"
+        picked = ""
+        for line in reversed(screen.splitlines()):
+            line = line.strip()
+            if not line or any(m in line for m in jroute.CHROME):
+                continue
+            picked = line
+            break
+        self.assertEqual(picked, "Running the test suite...")
 
 
 class TestStatusVersion(unittest.TestCase):

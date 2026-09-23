@@ -465,6 +465,8 @@ wrong, the correction is here rather than silently edited away.
 | Jev routes by complexity | routine task: `chore` 0.97, complexity 0.12, offset 0, cheapest models. Hard task: `implement` 0.56, complexity 2.83, consequence 0.81, offset 2, strongest models. Roughly 450 Jev input tokens per call. |
 | Jev orchestrates the shape | Four live tasks produced `answer`, `execute`, `execute`, and `plan -> execute -> review`, matching their actual difficulty. The headless answer path returned an accurate description of `eligible()` in 20 seconds. |
 | `pi -p` works headless | `pi -p --no-session --model opencode-go/deepseek-v4.1-flash --thinking low` answers on stdout and exits, reading repo files when it needs them. |
+| Live progress | Stage waits show a spinner, elapsed time, and the agent's current pane activity. A 51-second execute-only stage reported `0:03`, `0:06`, and so on instead of blocking silently for a minute. |
+| Execute-only shape ships real work | "add a --version flag to jroute status" produced the `execute` shape, ran no plan stage and no Astra, and committed `54fd2aa`, which `jroute status --version` prints. |
 | Review independence enforced | Hard-task run paired a `qwen3` executor with a `kimi` reviewer. |
 | Token accounting | `cacheRead` is 42x output on a normal agent session, which is why the budget is reported per component rather than folded into one number. |
 
@@ -474,6 +476,8 @@ wrong, the correction is here rather than silently edited away.
 - **Token budget is per stage, not one number.** Section 9 originally said to start at 150k. Measured costs are 318k, 706k, and 506k, so one threshold is meaningless.
 - **`opencode-go/kimi-k3-high` does not exist**, and its absence caught a real bug: OpenCode Go has `kimi-k3`. The catalog is now probed and validated against, so a wrong-provider model id is rejected at routing time instead of failing at launch.
 - **`--no-focus` is the default, not a flag.** Section 11 listed it as one. The actual flags are `--focus` to opt into focus stealing, `--keep-panes`, and `--no-jev`.
+- **The `execute`-only shape was broken when first added.** Its brief said "implement the plan at <path>" when no plan stage had run, so it aborted every time. Stage briefs are now chosen by whether the shape includes a plan: `BRIEFS["execute"]` follows a plan file, `BRIEFS["implement"]` carries the task directly. Only a live run caught this, because `--dry-run` never reaches the brief.
+- **`agent prompt --wait` was the wrong primitive for visible progress.** It blocks silently for the whole stage. Stages now submit and then poll `agent get` plus `pane read`, so the wait reports real activity.
 
 ### Not built, deliberately
 

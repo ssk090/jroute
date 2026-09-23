@@ -600,6 +600,7 @@ def format_elapsed(seconds, width=60):
 
 
 CHROME = ("esc interrupt", "escape interrupt", "(auto)", "Ctrl+P", "press ctrl",
+          "ponytail", "⚡", "🐴",
           "└", "┘", "┌", "┐", "─", "▄", "▀")
 
 
