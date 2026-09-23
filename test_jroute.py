@@ -24,6 +24,9 @@ CONFIG = {
                    "opencode-go/qwen3.7-max"],
     },
     "effort": {"plan": "medium", "execute": "low", "review": "medium"},
+    "shape": {"question_threshold": 0.6, "design_threshold": 0.5,
+              "review_consequence": 0.7, "review_complexity": 3,
+              "default": ["plan", "execute"]},
     "gates": {"codex": {"primary_5h_max": 70, "secondary_7d_max": 85},
               "cursor": {"auto_bucket_max": 85, "api_bucket_max": 85, "total_max": 90}},
     "token_warn_per_stage": 150000,
@@ -504,6 +507,77 @@ class TestStatusCli(unittest.TestCase):
                 redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
             jroute.main()
         self.assertEqual(cm.exception.code, 2)
+
+
+class TestJevShape(unittest.TestCase):
+    """Jev judges, code decides the pipeline. The whole point is that a question never pays
+    for an Astra plan."""
+
+    def answers(self, complexity=1.0, confidence=0.9, question=0.0,
+                needs_design=0.0, consequence=0.1):
+        return {"complexity": {"score": complexity, "confidence": confidence},
+                "is_question": {"noul": question},
+                "needs_design": {"noul": needs_design},
+                "consequence": {"noul": consequence}}
+
+    def test_a_question_gets_answered_not_planned(self):
+        self.assertEqual(jroute.jev_shape(self.answers(question=0.95), CONFIG), ("answer",))
+
+    def test_a_question_is_still_a_question_when_it_is_complex(self):
+        """'Explain how the quota gate works' is complex to answer and needs no pipeline."""
+        shape = jroute.jev_shape(self.answers(complexity=3.5, question=0.9), CONFIG)
+        self.assertEqual(shape, ("answer",))
+
+    def test_a_routine_change_with_no_design_goes_straight_to_execute(self):
+        shape = jroute.jev_shape(self.answers(complexity=0.4, needs_design=0.1), CONFIG)
+        self.assertEqual(shape, ("execute",), "no plan stage, so Astra never runs")
+
+    def test_a_routine_change_that_needs_design_still_gets_a_plan(self):
+        shape = jroute.jev_shape(self.answers(complexity=0.4, needs_design=0.9), CONFIG)
+        self.assertEqual(shape, ("plan", "execute"))
+
+    def test_moderate_work_gets_plan_and_execute(self):
+        shape = jroute.jev_shape(self.answers(complexity=2.0), CONFIG)
+        self.assertEqual(shape, ("plan", "execute"))
+
+    def test_hard_work_adds_the_review_stage(self):
+        shape = jroute.jev_shape(self.answers(complexity=3.2), CONFIG)
+        self.assertEqual(shape, ("plan", "execute", "review"))
+
+    def test_high_consequence_adds_the_review_stage_even_when_routine(self):
+        shape = jroute.jev_shape(self.answers(complexity=0.5, consequence=0.85), CONFIG)
+        self.assertEqual(shape, ("plan", "execute", "review"))
+
+    def test_low_confidence_escalates_the_shape_not_just_the_chain(self):
+        """Complexity 0.5 with 0.4 confidence must not be treated as routine."""
+        shape = jroute.jev_shape(self.answers(complexity=0.5, confidence=0.4), CONFIG)
+        self.assertEqual(shape, ("plan", "execute"))
+
+    def test_no_answers_falls_back_to_the_configured_default(self):
+        for missing in (None, {}):
+            self.assertEqual(jroute.jev_shape(missing, CONFIG), ("plan", "execute"))
+
+    def test_thresholds_are_configurable_not_hardcoded(self):
+        strict = dict(CONFIG, shape=dict(CONFIG["shape"], question_threshold=0.99))
+        loose = self.answers(question=0.7)
+        self.assertEqual(jroute.jev_shape(loose, CONFIG), ("answer",))
+        self.assertNotEqual(jroute.jev_shape(loose, strict), ("answer",))
+
+
+class TestAnswerArgv(unittest.TestCase):
+    def test_pi_providers_use_print_mode_without_a_session(self):
+        argv = jroute.answer_argv("opencode-go/deepseek-v4.1-flash", "low")
+        self.assertEqual(argv, ["pi", "-p", "--no-session",
+                                "--model", "opencode-go/deepseek-v4.1-flash",
+                                "--thinking", "low"])
+
+    def test_cursor_uses_its_own_print_flag(self):
+        self.assertEqual(jroute.answer_argv("cursor/gpt-5.4-mini-medium", "low"),
+                         ["cursor-agent", "-p", "--model", "gpt-5.4-mini-medium"])
+
+    def test_unknown_provider_raises(self):
+        with self.assertRaises(RuntimeError):
+            jroute.answer_argv("mistral/large", "low")
 
 
 class TestLaunchArgv(unittest.TestCase):

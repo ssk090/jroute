@@ -211,6 +211,43 @@ def family_of(model_id):
     return re.split(r"[-.]", name)[0].lower()
 
 
+def noul(answers, name):
+    """Read a calibrated probability out of a Jev answer, defaulting to zero."""
+    value = (answers.get(name) or {}).get("noul")
+    return value if isinstance(value, (int, float)) else 0.0
+
+
+def jev_shape(answers, config):
+    """Jev judges the task; code decides the pipeline. Returns the stages to run.
+
+    A question must never pay for a plan, and neither must a routine change with no design
+    decisions. Order matters: the cheapest shape wins a tie.
+    """
+    policy = config.get("shape") or {}
+    if not answers:
+        return tuple(policy.get("default") or ("plan", "execute"))
+
+    complexity = (answers.get("complexity") or {}).get("score")
+    confidence = (answers.get("complexity") or {}).get("confidence") or 0
+    consequence = noul(answers, "consequence")
+    if isinstance(complexity, (int, float)) and confidence < 0.6:
+        complexity += 1  # under-powering costs a failed attempt, so never round down
+
+    if noul(answers, "is_question") > policy.get("question_threshold", 0.6):
+        return ("answer",)
+
+    hard = (isinstance(complexity, (int, float))
+            and complexity >= policy.get("review_complexity", 3))
+    if hard or consequence > policy.get("review_consequence", 0.7):
+        return ("plan", "execute", "review")
+
+    needs_design = noul(answers, "needs_design") > policy.get("design_threshold", 0.5)
+    routine = isinstance(complexity, (int, float)) and complexity <= 1
+    if not needs_design and routine:
+        return ("execute",)
+    return ("plan", "execute")
+
+
 def jev_start_index(answers):
     """Map Jev's judgment onto a chain offset. Not a model choice, a starting point.
 
@@ -274,6 +311,16 @@ JEV_QUESTIONS = {
         "instructions": "Would a wrong answer here be expensive to undo, or does this "
                         "touch high-risk ground such as production, security, money, or "
                         "data loss?",
+    },
+    "is_question": {
+        "type": "noul",
+        "instructions": "Is this asking for information, explanation, or analysis rather "
+                        "than a change to the repository?",
+    },
+    "needs_design": {
+        "type": "noul",
+        "instructions": "Does this require design or specification decisions before code "
+                        "can be written, or is the approach already determined?",
     },
     "min_effort": {
         "type": "choice",
@@ -587,6 +634,42 @@ def cmd_status(config, json_mode=False):
             print(f"  {reason}: {', '.join(ids)}")
 
 
+def answer_argv(route, effort):
+    """Headless form of the same launch: pi's print mode answers and exits."""
+    provider, name = route.split("/", 1)
+    if provider in ("openai-codex", "opencode-go"):
+        argv = ["pi", "-p", "--no-session", "--model", route]
+        if effort:
+            argv += ["--thinking", effort]
+        return argv
+    if provider == "cursor":
+        return ["cursor-agent", "-p", "--model", name]
+    raise RuntimeError(f"no headless launcher for provider {provider!r}")
+
+
+BANNER = ("[pi-web-access]", "[Context]", "[Skills]", "[Prompts]", "[Extensions]")
+
+
+def cmd_answer(task, route, effort, timeout_s):
+    """Questions get an answer on stdout, not a plan artifact and a pane. That is the
+    difference between a 300k-token detour through Astra and a ten-second cheap reply."""
+    argv = answer_argv(route, effort)
+    print(f"  answer   -> {route}  ({effort})  headless\n", flush=True)
+    try:
+        proc = subprocess.run(argv + ["--", task], capture_output=True, text=True,
+                              timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        print(f"  answer: timed out after {timeout_s}s", file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        print(f"  answer: exit {proc.returncode}: {proc.stderr.strip()[:300]}", file=sys.stderr)
+        return 1
+    for line in proc.stdout.splitlines():
+        if not any(line.startswith(marker) for marker in BANNER):
+            print(line)
+    return 0
+
+
 def all_chain_models(config):
     return [m for chain in config["stages"].values() for m in chain]
 
@@ -598,22 +681,35 @@ def cmd_run(task, config, args):
 
     answers = None if args.no_jev else classify(task)
     start = jev_start_index(answers)
-    stages = [args.stage] if args.stage else ["plan", "execute", "review"]
     ok_ids, excluded = eligible(snaps, config, all_chain_models(config))
 
     print(f"jroute: {task}\n")
     if answers:
-        fam = answers.get("family") or {}
         comp = answers.get("complexity") or {}
-        cons = answers.get("consequence") or {}
-        print(f"  jev: {fam.get('choice')} (conf {fam.get('confidence')})  "
+        print(f"  jev: {(answers.get('family') or {}).get('choice')}  "
               f"complexity {comp.get('score')} (conf {comp.get('confidence')})  "
-              f"consequence {cons.get('noul')}  -> chain offset {start}")
+              f"question {noul(answers, 'is_question'):.2f}  "
+              f"needs_design {noul(answers, 'needs_design'):.2f}  "
+              f"consequence {noul(answers, 'consequence'):.2f}")
     elif not args.no_jev:
         print("  jev: unavailable, starting each chain at its cheapest eligible model")
 
+    shape = (args.stage,) if args.stage else jev_shape(answers, config)
+    print(f"  shape: {' -> '.join(shape)}")
+
+    if shape == ("answer",):
+        route = resolve("answer", ok_ids, config, start)
+        if not route:
+            print("  answer: NO ELIGIBLE MODEL")
+            return 1
+        effort = config["effort"].get("answer", "low")
+        if args.dry_run:
+            print(f"  answer   -> {route}  ({effort})  headless")
+            return 0
+        return cmd_answer(task, route, effort, args.timeout)
+
     records, ran_families, exit_code = [], [], 0
-    for stage in stages:
+    for stage in shape:
         # The plan chain is a fixed preference order, not a capability ladder: Astra first,
         # Sol as fallback. Jev's complexity offset must not move it off that order.
         offset = 0 if stage == "plan" else start

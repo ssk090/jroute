@@ -405,7 +405,48 @@ reproducible offline without a key or a call.
 
 ---
 
-## 13. Verification log
+## 13. Jev orchestrates the pipeline shape
+
+Jev does not only offset the chains. It decides **which stages run at all**, because paying a
+300k-token planning detour for "what does this function do" is the single largest waste this
+design can avoid.
+
+Jev answers two extra `noul` questions alongside complexity and consequence:
+
+- `is_question`: asking for information or analysis rather than a change
+- `needs_design`: does this need design decisions before code can be written
+
+Code turns those into a shape. Jev judges, code owns the policy, and the thresholds live in
+`config.shape` so they stay tunable:
+
+| Jev's read | Shape | What runs |
+|---|---|---|
+| `is_question > 0.6` | `answer` | Headless one-shot reply on stdout. No pane, no plan artifact, no Astra. |
+| routine and `needs_design <= 0.5` | `execute` | Straight to a cheap executor. **No plan stage.** |
+| moderate, or design needed | `plan -> execute` | Astra plans, a cheap model executes. |
+| complexity `>= 3` or consequence `> 0.7` | `plan -> execute -> review` | Full pipeline with an independent reviewer. |
+
+Order matters: the cheapest shape wins a tie. A question is answered even when it is complex
+to answer, because explaining something deeply is still not a code change. Low confidence
+raises complexity before the shape decision, so an uncertain routine task gets a plan rather
+than a blind edit.
+
+Measured behaviour on four live tasks:
+
+| Task | Jev's read | Shape |
+|---|---|---|
+| "what does the redact function do?" | question 0.97 | `answer`, 20s headless |
+| "rename the foo variable to bar" | chore, complexity 0.14, design 0.15 | `execute` |
+| "add a --verbose flag to the status command" | complexity 0.77, design 0.43 | `execute` |
+| "redesign the quota gate across three providers" | complexity 2.79, design 0.91, consequence 0.73 | `plan -> execute -> review` |
+
+The economy of this: the old behaviour charged every task for an Astra plan at 318k tokens.
+Now Astra plans only the tasks whose `needs_design` and complexity say they need it, and a
+question costs a 10 to 20 second reply on a flat-rate model.
+
+---
+
+## 14. Verification log
 
 Everything below was run, not reasoned about. Where a claim in earlier sections turned out
 wrong, the correction is here rather than silently edited away.
@@ -421,7 +462,9 @@ wrong, the correction is here rather than silently edited away.
 | pi launches Codex and OpenCode Go for all three stages | `herdr agent start plan --kind pi -- --model openai-codex/gpt-6-astra --thinking medium` returned `interactive_ready: true` and handed back the pi session path. |
 | cursor-agent launches | `--kind cursor -- --model gpt-5.6-sol-high` started and completed a real task. |
 | Path handoff works | Astra wrote a 35-line plan with all four sections; `deepseek-v4.1-flash` read it from disk on a different subscription and implemented it, adding 15 tests; `glm-5.3` reviewed it and found a real issue. |
-| Jev routes by complexity | routine task: `chore` 0.97, complexity 0.12, offset 0, cheapest models. Hard task: `implement` 0.56, complexity 2.83, consequence 0.81, offset 2, strongest models. 448 Jev input tokens per call. |
+| Jev routes by complexity | routine task: `chore` 0.97, complexity 0.12, offset 0, cheapest models. Hard task: `implement` 0.56, complexity 2.83, consequence 0.81, offset 2, strongest models. Roughly 450 Jev input tokens per call. |
+| Jev orchestrates the shape | Four live tasks produced `answer`, `execute`, `execute`, and `plan -> execute -> review`, matching their actual difficulty. The headless answer path returned an accurate description of `eligible()` in 20 seconds. |
+| `pi -p` works headless | `pi -p --no-session --model opencode-go/deepseek-v4.1-flash --thinking low` answers on stdout and exits, reading repo files when it needs them. |
 | Review independence enforced | Hard-task run paired a `qwen3` executor with a `kimi` reviewer. |
 | Token accounting | `cacheRead` is 42x output on a normal agent session, which is why the budget is reported per component rather than folded into one number. |
 
@@ -444,7 +487,7 @@ wrong, the correction is here rather than silently edited away.
 
 ---
 
-## 14. First three actions
+## 15. First three actions
 
 1. Get a Jev key and confirm one `systemone` call.
 2. Prove the pane layer by hand: split, start pi with a Codex model, prompt, read, close. That validates the riskiest assumption in the whole plan in about five minutes.

@@ -1,5 +1,11 @@
 {
   "stages": {
+    "answer": [
+      "opencode-go/deepseek-v4.1-flash",
+      "opencode-go/glm-5.3-flash",
+      "opencode-go/qwen3.8-flash",
+      "openai-codex/gpt-5.6-luna"
+    ],
     "plan": [
       "openai-codex/gpt-6-astra",
       "openai-codex/gpt-5.6-sol",
@@ -21,25 +27,27 @@
     ]
   },
   "effort": {
+    "answer": "low",
     "plan": "medium",
     "execute": "low",
     "review": "medium"
   },
-  "gates": {
-    "codex": {
-      "primary_5h_max": 70,
-      "secondary_7d_max": 85
-    },
-    "cursor": {
-      "auto_bucket_max": 85,
-      "api_bucket_max": 85,
-      "total_max": 90
-    }
+  "shape": {
+    "question_threshold": 0.6,
+    "design_threshold": 0.5,
+    "review_consequence": 0.7,
+    "review_complexity": 3,
+    "default": ["plan", "execute"]
   },
-  "plan_line_cap": 120,
+  "gates": {
+    "codex": { "primary_5h_max": 70, "secondary_7d_max": 85 },
+    "cursor": { "auto_bucket_max": 85, "api_bucket_max": 85, "total_max": 90 }
+  },
   "token_warn": {
+    "answer": 60000,
     "plan": 400000,
     "execute": 900000,
     "review": 650000
-  }
+  },
+  "plan_line_cap": 120
 }
