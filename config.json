@@ -39,13 +39,18 @@
     "review_complexity": 3,
     "default": ["plan", "execute"]
   },
+  "skills": {
+    "plan": ["to-spec", "to-tickets"],
+    "execute": ["implement", "tdd"],
+    "review": ["code-review"]
+  },
   "gates": {
     "codex": { "primary_5h_max": 70, "secondary_7d_max": 85 },
     "cursor": { "auto_bucket_max": 85, "api_bucket_max": 85, "total_max": 90 }
   },
   "token_warn": {
     "answer": 60000,
-    "plan": 400000,
+    "plan": 500000,
     "execute": 900000,
     "review": 650000
   },

@@ -185,6 +185,16 @@ The third link is the same model you chose as fallback, reachable through a diff
 | `code-review` | Review pane | Two-axis review (Standards and Spec) as parallel sub-agents, comparing the diff to the originating spec. |
 | `stuck-crewmate-recovery` | Supervision loop | The escalation ladder for a stuck stage. |
 | `gh-axi` | Plan pane, ticket fetch | Reading the GitHub issue or PR behind the ticket ref. |
+| `writing-for-agents` | The stage briefs themselves | Applied when writing `BRIEFS`: positive targets instead of prohibitions, per-stage skills via a context pointer, checkable completion criteria. |
+| `axi` | `jroute status --json` | Minimal default schema, detail behind `--full`, and a help hint while content is truncated. |
+
+Skills reach a stage through a **context pointer**, not an eager load: `brief_for` prepends
+`Load these skills first and follow them: ...`, and the skill body costs context only once
+that stage actually runs. `config.skills` holds the mapping, so it is policy, not code.
+
+Stage skills per `config.skills`: plan gets `to-spec` and `to-tickets`, execute gets
+`implement` and `tdd`, review gets `code-review`. The answer shape gets none, because a
+one-shot reply should not pay for a workflow it will not follow.
 
 Deliberately not used: `ralphex` (CMUX-specific orchestration, this is Herdr), `orchestration` (Orca-specific), `loop-me`, `afk`, everything chip1- and content-related.
 
@@ -465,7 +475,10 @@ wrong, the correction is here rather than silently edited away.
 | Jev routes by complexity | routine task: `chore` 0.97, complexity 0.12, offset 0, cheapest models. Hard task: `implement` 0.56, complexity 2.83, consequence 0.81, offset 2, strongest models. Roughly 450 Jev input tokens per call. |
 | Jev orchestrates the shape | Four live tasks produced `answer`, `execute`, `execute`, and `plan -> execute -> review`, matching their actual difficulty. The headless answer path returned an accurate description of `eligible()` in 20 seconds. |
 | `pi -p` works headless | `pi -p --no-session --model opencode-go/deepseek-v4.1-flash --thinking low` answers on stdout and exits, reading repo files when it needs them. |
-| Live progress | Stage waits show a spinner, elapsed time, and the agent's current pane activity. A 51-second execute-only stage reported `0:03`, `0:06`, and so on instead of blocking silently for a minute. |
+| Live progress | Stage waits show a spinner, elapsed time, live token use, and the agent's reasoning, tool calls, and output streamed from the session file. A 1m58s plan stage reported `0:03`, `0:06`, and so on, ending `↑38.3k ↓1.7k cache 404.9k think 36 $0.8747 17 steps` instead of blocking silently for two minutes. |
+| Reasoning is streamable | The session JSONL records `thinking`, `text`, and `toolCall` parts separately. Astra at medium effort emitted only two visible thinking blocks (`💭 Reviewing writing-agent guidance`), because OpenAI reasoning is largely encrypted; the plumbing is proven and deeper-thinking models will show more. |
+| The planner already reaches for skills | Unprompted, the plan stage read `using-superpowers`, `writing-for-agents`, and `pi-tools.md` from its own skill list before writing. Naming skills in the brief makes that reliable rather than incidental. |
+| AXI reduction | `jroute status --json` fell from 1902 to 899 bytes once the 28-entry auto bucket and 33-model catalog collapsed to counts, with `--full` as the escape hatch. |
 | Execute-only shape ships real work | "add a --version flag to jroute status" produced the `execute` shape, ran no plan stage and no Astra, and committed `54fd2aa`, which `jroute status --version` prints. |
 | Review independence enforced | Hard-task run paired a `qwen3` executor with a `kimi` reviewer. |
 | Token accounting | `cacheRead` is 42x output on a normal agent session, which is why the budget is reported per component rather than folded into one number. |
@@ -478,6 +491,8 @@ wrong, the correction is here rather than silently edited away.
 - **`--no-focus` is the default, not a flag.** Section 11 listed it as one. The actual flags are `--focus` to opt into focus stealing, `--keep-panes`, and `--no-jev`.
 - **The `execute`-only shape was broken when first added.** Its brief said "implement the plan at <path>" when no plan stage had run, so it aborted every time. Stage briefs are now chosen by whether the shape includes a plan: `BRIEFS["execute"]` follows a plan file, `BRIEFS["implement"]` carries the task directly. Only a live run caught this, because `--dry-run` never reaches the brief.
 - **`agent prompt --wait` was the wrong primitive for visible progress.** It blocks silently for the whole stage. Stages now submit and then poll `agent get` plus `pane read`, so the wait reports real activity.
+- **The briefs steered by prohibition.** They said "No preamble, no summary, no restating the task" and "Do not rewrite the plan". `writing-for-agents` treats negation as a failure mode, because naming a behaviour makes it more available rather than less. Every brief now states the positive target ("Reply with only the file path", "Treat the plan as read-only"), and a test asserts no brief contains `do not`, `don't`, or `never`.
+- **Plan budget raised to 500k.** The measured plan stage cost 444,912 tokens, above the 400k set from an earlier run of 318k. Plan cost varies with repo exploration, so the budget tracks the observed ceiling rather than one sample.
 
 ### Not built, deliberately
 
@@ -488,6 +503,8 @@ wrong, the correction is here rather than silently edited away.
 ### Remaining unknown
 
 `cursor-agent`'s busy signature, exit command, and interrupt key are still unverified. `herdr agent prompt --wait` uses Herdr's own status detection, so the happy path does not need them, but the stuck-stage ladder above cannot be written correctly without them.
+
+Not yet observed live: whether naming `to-spec` and `to-tickets` in the plan brief actually makes the planner load them. Tests assert the brief contains the names; confirming the load means watching one real plan run for a `→ read: .../skills/to-spec/SKILL.md` line in the stream.
 
 ---
 

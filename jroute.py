@@ -388,23 +388,37 @@ def classify(task):
 # token accounting
 # --------------------------------------------------------------------------------------
 
+def absorb_usage(totals, usage):
+    """Add one usage block into running totals. pi reports `cost` as a nested dict, so a plain
+    numeric check silently reports zero spend."""
+    if not isinstance(usage, dict):
+        return
+    for src, dst in (("input", "input"), ("output", "output"), ("cacheRead", "cache_read"),
+                     ("cacheWrite", "cache_write"), ("reasoning", "reasoning")):
+        value = usage.get(src)
+        if isinstance(value, (int, float)):
+            totals[dst] = totals.get(dst, 0) + value
+    cost = usage.get("cost")
+    if isinstance(cost, (int, float)):
+        totals["cost"] = totals.get("cost", 0.0) + cost
+    elif isinstance(cost, dict) and isinstance(cost.get("total"), (int, float)):
+        totals["cost"] = totals.get("cost", 0.0) + cost["total"]
+
+
+def new_totals():
+    return {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+            "reasoning": 0, "cost": 0.0, "turns": 0}
+
+
 def parse_pi_usage(text):
     """Sum usage blocks from a pi session JSONL. cacheRead dominates, so keep it separate."""
-    tot = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0, "turns": 0}
+    tot = new_totals()
 
     def walk(node):
         if isinstance(node, dict):
-            usage = node.get("usage")
-            if isinstance(usage, dict):
+            if isinstance(node.get("usage"), dict):
                 tot["turns"] += 1
-                for src, dst in (("input", "input"), ("output", "output"),
-                                 ("cacheRead", "cache_read"), ("cacheWrite", "cache_write")):
-                    val = usage.get(src)
-                    if isinstance(val, (int, float)):
-                        tot[dst] += val
-                cost = usage.get("cost")
-                if isinstance(cost, (int, float)):
-                    tot["cost"] += cost
+                absorb_usage(tot, node["usage"])
             for value in node.values():
                 walk(value)
         elif isinstance(node, list):
@@ -491,44 +505,54 @@ def plan_path_for(task):
 
 
 BRIEFS = {
-    "plan": """Write an implementation plan. Do not write product code.
+    "plan": """Write an implementation plan.
 
 Task: {task}
 
 Steps:
 1. If a ticket reference appears above, fetch it with gh-axi.
-2. Read only what you need to write a precise plan.
+2. Read what the plan needs to name: the files, the seams, the constraints.
+3. Write the plan to {plan_path}, under {cap} lines, with exactly these sections:
+   ## acceptance criteria
+   ## files to change
+   ## test seams
+   ## suggested skills
 
-Write the plan to {plan_path}, strictly under {cap} lines, with exactly these sections:
-## acceptance criteria
-## files to change
-## test seams
-## suggested skills
+Name real file paths and real test seams. Reply with only the file path.""",
+    "execute": """Implement the plan at {plan_path}.
 
-No preamble, no summary, no restating the task. Name real file paths and real test seams.
-Reply with only the file path.""",
-    "execute": """Implement the plan at {plan_path}. Load the skills it lists under
-"suggested skills". Follow its test seams. Run typecheck and the test suite, then commit to
-the current branch. Do not rewrite the plan. Reply with only the commit sha.""",
-    "implement": """Implement this change directly, with no plan document to follow:
+Treat the plan as read-only: follow its acceptance criteria and test seams, and leave the
+document itself untouched. Run typecheck and the test suite, then commit to the current
+branch. Reply with only the commit sha.""",
+    "implement": """Implement this change directly:
 
 {task}
 
-Read only what you need. Run typecheck and the test suite, then commit to the current
-branch. Keep it the smallest change that works. Reply with only the commit sha.
-No preamble, no summary.""",
+Keep it the smallest change that works. Run typecheck and the test suite, then commit to
+the current branch. Reply with only the commit sha.""",
     "review": """Run /code-review since the merge-base, checking the diff against the
-acceptance criteria in {plan_path}. Append your findings under a "## review findings"
-heading in that file. Report only actionable findings.""",
+acceptance criteria in {plan_path}. Append findings under a "## review findings" heading in
+that file, listing only issues that need a change.""",
 }
+
+
+SKILL_LINE = "Load these skills first and follow them: {names}."
 
 
 def brief_for(stage, task, config, plan_path, has_plan):
     """A routine task skips the plan stage, so the executor must not be told to follow a plan
-    that was never written. That is the difference between the two execute briefs."""
+    that was never written. That is the difference between the two execute briefs.
+
+    Skills are named here rather than passed as --skill so the whole skill is loaded only
+    when the stage runs, instead of paying its context load on every stage.
+    """
     key = "implement" if stage == "execute" and not has_plan else stage
-    return BRIEFS[key].format(task=task, plan_path=plan_path,
-                              cap=config["plan_line_cap"])
+    brief = BRIEFS[key].format(task=task, plan_path=plan_path,
+                               cap=config["plan_line_cap"])
+    names = (config.get("skills") or {}).get(stage) or []
+    if names:
+        brief = SKILL_LINE.format(names=", ".join(names)) + "\n\n" + brief
+    return brief
 
 
 def run_stage(stage, task, route, config, keep_panes=False, focus=False, timeout_s=900,
@@ -558,7 +582,7 @@ def run_stage(stage, task, route, config, keep_panes=False, focus=False, timeout
             keep = True
             return None
         herdr("agent", "prompt", name, brief)  # submit, then watch for real progress
-        settled = wait_for_stage(name, pane_id, timeout_s)
+        settled = wait_for_stage(name, pane_id, timeout_s, session=session)
         if settled == "timeout":
             keep = True
             return None
@@ -671,14 +695,16 @@ def agent_status(target):
         return "unknown"
 
 
-def wait_for_stage(target, pane_id, timeout_s, poll=3.0):
+def wait_for_stage(target, pane_id, timeout_s, session=None, poll=1.0, show_thinking=True):
     """Submit nothing, just watch. Replaces `agent prompt --wait`, which blocks silently for
-    minutes; this shows elapsed time and what the agent is doing right now.
+    minutes; this streams the agent's reasoning, tool calls, and output as they happen, with
+    a live status line for elapsed time and token use.
 
     A settled state is idle, done, or blocked. A submission is accepted before the agent
     flips to working, so the first seconds are spent waiting for that transition."""
     deadline = time.time() + timeout_s
-    spin = Spinner(f"{target} working")
+    spin = Spinner(f"{target}")
+    stream = SessionStream(session, enabled=spin.enabled, show_thinking=show_thinking)
     saw_working = False
     while time.time() < deadline:
         status = agent_status(target)
@@ -686,18 +712,136 @@ def wait_for_stage(target, pane_id, timeout_s, poll=3.0):
             saw_working = True
         elif status in ("idle", "done"):
             if saw_working:
-                spin.done(f"{target} finished in {format_elapsed(time.time() - spin.started)}")
+                stream.poll()
+                spin.done(f"{target} finished in {format_elapsed(time.time() - spin.started)}"
+                          + (f"  {stream.summary()}" if stream.summary() else ""))
                 return status
             # It may have finished before the first poll. Give the transition a few seconds
             # before accepting idle, then let the artifact checks decide if anything happened.
             if time.time() - spin.started > 8:
+                stream.poll()
                 spin.done(f"{target} settled in {format_elapsed(time.time() - spin.started)}")
                 return status
-        spin.tick(pane_activity(pane_id))
+        stream.poll()
+        detail = stream.summary() or pane_activity(pane_id)
+        spin.tick(detail)
         time.sleep(poll)
     spin.done()
     print(f"  {target}: timed out after {format_elapsed(timeout_s)}, leaving the pane open")
     return "timeout"
+
+
+def short_count(value):
+    """18154 -> 18.2k. Token counts get long fast and the progress line is one line."""
+    if not isinstance(value, (int, float)) or value < 1000:
+        return str(int(value or 0))
+    if value < 1_000_000:
+        return f"{value / 1000:.1f}k"
+    return f"{value / 1_000_000:.2f}M"
+
+
+def render_event(entry, width=96, thinking_chars=400):
+    """Turn one session entry into printable (kind, text) lines. Pure, so it is testable.
+
+    pi records thinking, text, and tool calls as separate content parts, which is why
+    tailing the session file beats scraping the rendered pane.
+    """
+    message = entry.get("message") or {}
+    role = message.get("role")
+    content = message.get("content")
+    out = []
+    if not isinstance(content, list):
+        return out
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind == "thinking":
+            text = " ".join((part.get("thinking") or "").split())
+            if text:
+                clipped = text[:thinking_chars] + (" …" if len(text) > thinking_chars else "")
+                out.append(("think", clipped))
+        elif kind == "text" and role == "assistant":
+            text = (part.get("text") or "").strip()
+            if text:
+                out.append(("say", text[:width * 4]))
+        elif kind == "toolCall":
+            args = part.get("arguments") or {}
+            detail = (args.get("command") or args.get("path") or args.get("pattern")
+                      or args.get("file_path") or "")
+            out.append(("tool", f"{part.get('name', '?')}: {' '.join(str(detail).split())[:width]}"))
+    return out
+
+
+EVENT_PREFIX = {"think": "  💭 ", "say": "  ✎  ", "tool": "  →  "}
+
+
+class SessionStream:
+    """Tails a pi session JSONL and renders reasoning, tool calls, output, and live token use.
+
+    Reading the session file rather than the pane is deliberate: it is structured, it includes
+    thinking blocks that the pane may hide, and every message carries its own usage.
+    """
+
+    def __init__(self, path, enabled=None, show_thinking=True):
+        self.path = Path(path) if path else None
+        self.enabled = sys.stdout.isatty() if enabled is None else enabled
+        self.show_thinking = show_thinking
+        self.offset = 0
+        self.buffer = ""
+        self.totals = new_totals()
+
+    def poll(self):
+        if not self.enabled or not self.path or not self.path.exists():
+            return
+        try:
+            size = self.path.stat().st_size
+            if size < self.offset:
+                self.offset = 0  # truncated or replaced
+            if size == self.offset:
+                return
+            with self.path.open() as handle:
+                handle.seek(self.offset)
+                self.buffer += handle.read()
+                self.offset = handle.tell()
+        except OSError:
+            return
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            message = entry.get("message") or {}
+            if isinstance(message.get("usage"), dict):
+                self.totals["turns"] += 1
+                absorb_usage(self.totals, message["usage"])
+            for kind, text in render_event(entry):
+                if kind == "think" and not self.show_thinking:
+                    continue
+                self.emit(kind, text)
+
+    def emit(self, kind, text):
+        print("\r" + " " * 110 + "\r", end="", flush=True)
+        print(f"{EVENT_PREFIX.get(kind, '  ')}{text}", flush=True)
+
+    def summary(self):
+        t = self.totals
+        if not t["turns"] and not t["input"] and not t["output"]:
+            return ""  # nothing recorded yet, so let the caller show pane activity instead
+        parts = [f"↑{short_count(t['input'])} ↓{short_count(t['output'])}"]
+        if t["cache_read"]:
+            parts.append(f"cache {short_count(t['cache_read'])}")
+        if t["reasoning"]:
+            parts.append(f"think {short_count(t['reasoning'])}")
+        if t["cost"]:
+            parts.append(f"${t['cost']:.4f}")
+        if t["turns"]:
+            parts.append(f"{t['turns']} steps")
+        return "  ".join(parts)
 
 
 # --------------------------------------------------------------------------------------
@@ -711,25 +855,42 @@ def fmt_reset(seconds):
     return f"{mins // 60}h{mins % 60:02d}m" if mins >= 60 else f"{mins}m"
 
 
-def cmd_status(config, json_mode=False):
+def minimal_snapshots(snaps, full=False):
+    """AXI: the default schema carries only what a caller needs to decide what to do next.
+    The 28-entry auto bucket and the 33-model catalog are detail views, not decisions, so
+    they collapse to a count unless --full asks for them."""
+    out = {}
+    for name, snap in snaps.items():
+        snap = dict(snap)
+        if full:
+            if "auto_bucket" in snap:
+                snap["auto_bucket"] = sorted(snap["auto_bucket"])
+        else:
+            for key, count_key in (("auto_bucket", "auto_bucket_count"),
+                                   ("models", "model_count")):
+                if key in snap:
+                    snap[count_key] = len(snap[key])
+                    del snap[key]
+        out[name] = snap
+    return out
+
+
+def cmd_status(config, json_mode=False, full=False):
     snaps, errors = probe_all()
     ok_ids, excluded = eligible(snaps, config, all_chain_models(config))
 
     if json_mode:
-        serializable = {}
-        for name, snap in snaps.items():
-            snap = dict(snap)
-            if "auto_bucket" in snap:
-                snap["auto_bucket"] = sorted(snap["auto_bucket"])
-            serializable[name] = snap
-        print(json.dumps({
-            "snapshots": serializable,
+        payload = {
+            "snapshots": minimal_snapshots(snaps, full),
             "errors": errors,
             "routes": {stage: {"model": resolve(stage, ok_ids, config),
                                "effort": config["effort"].get(stage, "")}
                        for stage in config["stages"]},
             "exclusions": [{"model": mid, "reason": reason} for mid, reason in excluded],
-        }))
+        }
+        if not full:
+            payload["help"] = ["Pass --full for the auto-bucket and model lists."]
+        print(json.dumps(payload))
         return
 
     print("jroute status\n")
@@ -927,6 +1088,8 @@ def main():
                         help="emit one machine-readable JSON object instead of text")
     status.add_argument("--version", action="store_true",
                         help="print the git short sha of the running checkout and exit")
+    status.add_argument("--full", action="store_true",
+                        help="with --json, include the auto-bucket and model lists")
 
     run = sub.add_parser("run", help="route and run the pipeline")
     run.add_argument("task")
@@ -951,7 +1114,7 @@ def main():
     config = json.loads(CONFIG_PATH.read_text())
 
     if args.cmd == "status":
-        cmd_status(config, args.json)
+        cmd_status(config, args.json, args.full)
     elif args.cmd == "run":
         if not args.dry_run and not inside_herdr():
             sys.exit("jroute run needs $HERDR_ENV=1; use --dry-run outside Herdr")

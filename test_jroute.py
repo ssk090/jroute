@@ -8,8 +8,10 @@ token accounting, and redaction. These are the seams where routing bugs would hi
 import io
 import json
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import jroute
@@ -27,6 +29,7 @@ CONFIG = {
     "shape": {"question_threshold": 0.6, "design_threshold": 0.5,
               "review_consequence": 0.7, "review_complexity": 3,
               "default": ["plan", "execute"]},
+    "skills": {"plan": ["to-spec"], "execute": ["implement"], "review": ["code-review"]},
     "gates": {"codex": {"primary_5h_max": 70, "secondary_7d_max": 85},
               "cursor": {"auto_bucket_max": 85, "api_bucket_max": 85, "total_max": 90}},
     "token_warn_per_stage": 150000,
@@ -367,12 +370,12 @@ EXPECTED_TEXT_PROBE_ERROR = (
 )
 
 
-def status_json(snaps, errors, config=CONFIG):
+def status_json(snaps, errors, config=CONFIG, full=False):
     """Run cmd_status in JSON mode with probe_all stubbed; return (parsed, probe_mock)."""
     buf = io.StringIO()
     with patch.object(jroute, "probe_all", return_value=(snaps, errors)) as probe:
         with redirect_stdout(buf):
-            jroute.cmd_status(config, True)
+            jroute.cmd_status(config, True, full)
     return json.loads(buf.getvalue()), probe
 
 
@@ -389,9 +392,31 @@ def run_main(argv):
 class TestStatusJson(unittest.TestCase):
     def test_emits_exactly_one_object_with_the_documented_top_level_schema(self):
         payload, probe = status_json(ALL_OK, {})
-        self.assertEqual(set(payload), {"snapshots", "errors", "routes", "exclusions"})
+        self.assertEqual(set(payload),
+                         {"snapshots", "errors", "routes", "exclusions", "help"})
         self.assertEqual(payload["errors"], {})
         probe.assert_called_once()
+
+    def test_full_output_drops_the_help_hint_and_expands_the_detail(self):
+        """AXI truncation rule: name the escape hatch only while content is truncated."""
+        payload, _ = status_json(ALL_OK, {}, full=True)
+        self.assertNotIn("help", payload)
+        self.assertIn("auto_bucket", payload["snapshots"]["cursor"])
+        self.assertIn("models", payload["snapshots"]["opencode-go"])
+
+    def test_default_schema_collapses_detail_lists_to_counts(self):
+        """AXI minimal schema: 28 bucket entries and 33 model ids are detail, not decisions."""
+        payload, _ = status_json(ALL_OK, {})
+        cursor = payload["snapshots"]["cursor"]
+        self.assertNotIn("auto_bucket", cursor)
+        self.assertEqual(cursor["auto_bucket_count"], 2)
+        self.assertEqual(payload["snapshots"]["opencode-go"]["model_count"], 6)
+        self.assertNotIn("models", payload["snapshots"]["opencode-go"])
+
+    def test_default_schema_is_smaller_than_the_full_one(self):
+        lean, _ = status_json(ALL_OK, {})
+        fat, _ = status_json(ALL_OK, {}, full=True)
+        self.assertLess(len(json.dumps(lean)), len(json.dumps(fat)))
 
     def test_snapshots_preserve_the_normalized_data_and_source_set(self):
         payload, _ = status_json(ALL_OK, {})
@@ -404,7 +429,7 @@ class TestStatusJson(unittest.TestCase):
         self.assertIs(codex["limit_reached"], False)
 
     def test_cursor_auto_bucket_serializes_sorted_without_mutating_the_snapshot(self):
-        payload, _ = status_json(ALL_OK, {})
+        payload, _ = status_json(ALL_OK, {}, full=True)
         self.assertEqual(payload["snapshots"]["cursor"]["auto_bucket"],
                          ["composer-2.5", "grok-4.5"])
         self.assertIsInstance(ALL_OK["cursor"]["auto_bucket"], set)
@@ -461,7 +486,7 @@ class TestStatusJson(unittest.TestCase):
 
     def test_missing_quota_values_serialize_as_null(self):
         snaps = {"codex": jroute.normalize_codex({}), "cursor": jroute.normalize_cursor({})}
-        payload, _ = status_json(snaps, {})
+        payload, _ = status_json(snaps, {}, full=True)
         self.assertIsNone(payload["snapshots"]["codex"]["primary_used"])
         self.assertIsNone(payload["snapshots"]["codex"]["secondary_used"])
         self.assertIsNone(payload["snapshots"]["cursor"]["total_used"])
@@ -488,11 +513,15 @@ class TestStatusTextUnchanged(unittest.TestCase):
 class TestStatusCli(unittest.TestCase):
     def test_json_flag_dispatches_json_mode(self):
         status = run_main(["status", "--json"])
-        status.assert_called_once_with(CONFIG, True)
+        status.assert_called_once_with(CONFIG, True, False)
 
     def test_status_defaults_to_text_mode(self):
         status = run_main(["status"])
-        status.assert_called_once_with(CONFIG, False)
+        status.assert_called_once_with(CONFIG, False, False)
+
+    def test_full_flag_reaches_cmd_status(self):
+        status = run_main(["status", "--json", "--full"])
+        status.assert_called_once_with(CONFIG, True, True)
 
     def test_status_help_documents_the_json_flag(self):
         buf = io.StringIO()
@@ -589,14 +618,14 @@ class TestBriefFor(unittest.TestCase):
         brief = jroute.brief_for("execute", "do a thing", CONFIG, jroute.Path("/tmp/p.md"),
                                  has_plan=True)
         self.assertIn("/tmp/p.md", brief)
-        self.assertIn("Do not rewrite the plan", brief)
+        self.assertIn("read-only", brief, "positive phrasing, not 'do not rewrite'")
 
     def test_execute_without_a_plan_does_not_reference_one(self):
         brief = jroute.brief_for("execute", "add a --version flag", CONFIG,
                                  jroute.Path("/tmp/p.md"), has_plan=False)
         self.assertNotIn("plan at", brief)
         self.assertIn("add a --version flag", brief, "the task text must carry the intent")
-        self.assertIn("no plan document to follow", brief)
+        self.assertIn("directly", brief)
 
     def test_plan_brief_names_the_artifact_and_the_line_cap(self):
         brief = jroute.brief_for("plan", "ticket CHP-1", CONFIG, jroute.Path("/tmp/p.md"),
@@ -608,10 +637,39 @@ class TestBriefFor(unittest.TestCase):
         for stage in ("plan", "execute", "review", "implement"):
             self.assertIn(stage, jroute.BRIEFS)
 
-    def test_the_direct_brief_bans_filler_prose(self):
+    def test_briefs_steer_by_positive_target_not_prohibition(self):
+        """writing-for-agents: a negation activates the behaviour it bans, so every brief
+        states what to do instead of what to avoid."""
+        for stage in ("plan", "execute", "implement", "review"):
+            brief = jroute.brief_for("execute", "x", CONFIG, jroute.Path("/tmp/p.md"),
+                                     has_plan=stage == "execute").lower()
+            for banned in ("do not", "don't", "no preamble", "no summary", "never"):
+                self.assertNotIn(banned, brief, f"{stage} brief steers by prohibition")
+
+    def test_each_stage_names_its_skills(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["skills"] = {"plan": ["to-spec", "to-tickets"],
+                            "execute": ["implement", "tdd"],
+                            "review": ["code-review"]}
+        for stage, expected in config["skills"].items():
+            brief = jroute.brief_for(stage, "task", config, jroute.Path("/tmp/p.md"),
+                                     has_plan=True)
+            self.assertIn("Load these skills first", brief)
+            for name in expected:
+                self.assertIn(name, brief)
+
+    def test_a_stage_with_no_configured_skills_gets_no_skill_line(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["skills"] = {}
+        brief = jroute.brief_for("plan", "task", config, jroute.Path("/tmp/p.md"),
+                                 has_plan=False)
+        self.assertNotIn("Load these skills", brief)
+
+    def test_the_direct_execute_brief_keeps_its_completion_criterion(self):
+        """A checkable bound: the reply is the commit sha, so done is not a judgement call."""
         brief = jroute.brief_for("execute", "x", CONFIG, jroute.Path("/tmp/p.md"),
                                  has_plan=False)
-        self.assertIn("No preamble", brief)
+        self.assertIn("reply with only the commit sha", brief.lower())
 
 
 class TestProgress(unittest.TestCase):
@@ -623,11 +681,17 @@ class TestProgress(unittest.TestCase):
         self.assertEqual(jroute.format_elapsed(-5), "0:00")
 
     def test_spinner_is_silent_when_not_a_tty(self):
-        """Piped output must stay clean: no escape codes, no filler lines."""
+        """Piped output must stay clean: no escape codes, no filler frames. The completion
+        line still prints, because that belongs in a log."""
         spin = jroute.Spinner("test", enabled=False)
-        spin.tick("something")
-        spin.done("finished")
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            spin.tick("something")
+            spin.done("finished")
         self.assertFalse(spin.shown)
+        text = buffer.getvalue()
+        self.assertNotIn("\r", text)
+        self.assertEqual(text.strip(), "finished")
 
     def test_spinner_is_silent_before_its_delay_elapses(self):
         """A fast call shows nothing, so no spinner flashes for a two-second Jev answer."""
@@ -690,6 +754,113 @@ class TestStatusVersion(unittest.TestCase):
             jroute.main()
         self.assertEqual(out.getvalue().strip(), "abc1234")
         cmd.assert_not_called()
+
+
+class TestStreamRendering(unittest.TestCase):
+    """The session JSONL is the structured stream. Tailing it is why reasoning and token use
+    can be shown at all: the rendered pane may hide thinking entirely."""
+
+    def test_short_count_keeps_long_token_counts_readable(self):
+        self.assertEqual(jroute.short_count(0), "0")
+        self.assertEqual(jroute.short_count(999), "999")
+        self.assertEqual(jroute.short_count(18154), "18.2k")
+        self.assertEqual(jroute.short_count(1_500_000), "1.50M")
+
+    def test_renders_thinking_text_and_tool_calls_separately(self):
+        entry = {"message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "Let me look at the repo."},
+            {"type": "text", "text": "I will add the flag."},
+            {"type": "toolCall", "name": "bash", "arguments": {"command": "ls -la"}},
+        ]}}
+        self.assertEqual(jroute.render_event(entry), [
+            ("think", "Let me look at the repo."),
+            ("say", "I will add the flag."),
+            ("tool", "bash: ls -la"),
+        ])
+
+    def test_does_not_echo_the_user_prompt_as_assistant_output(self):
+        """The first text part in a session is the brief itself; echoing it is just noise."""
+        entry = {"message": {"role": "user", "content": [
+            {"type": "text", "text": "Implement this change directly..."}]}}
+        self.assertEqual(jroute.render_event(entry), [])
+
+    def test_truncates_long_thinking_and_flattens_newlines(self):
+        entry = {"message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "a\n\nb  " + "x" * 900}]}}
+        (kind, text), = jroute.render_event(entry)
+        self.assertEqual(kind, "think")
+        self.assertLessEqual(len(text), 403)
+        self.assertNotIn("\n", text)
+        self.assertTrue(text.endswith("…"))
+
+    def test_tolerates_unknown_and_malformed_parts(self):
+        entry = {"message": {"role": "assistant", "content": [
+            "not a dict", {"type": "weird"}, {"type": "thinking"}]}}
+        self.assertEqual(jroute.render_event(entry), [])
+        self.assertEqual(jroute.render_event({}), [])
+        self.assertEqual(jroute.render_event({"message": {"content": "a string"}}), [])
+
+    def test_usage_absorbs_both_numeric_and_nested_costs(self):
+        """pi reports cost as a dict. A numeric-only check silently reports zero spend."""
+        tot = jroute.new_totals()
+        jroute.absorb_usage(tot, {"input": 100, "output": 20, "reasoning": 7,
+                                  "cost": {"total": 0.0025}})
+        jroute.absorb_usage(tot, {"input": 5, "cost": 0.001})
+        self.assertEqual(tot["input"], 105)
+        self.assertEqual(tot["reasoning"], 7)
+        self.assertAlmostEqual(tot["cost"], 0.0035)
+
+    def test_parse_pi_usage_counts_cost_from_the_dict_form(self):
+        lines = [json.dumps({"message": {"usage": {"input": 18154, "output": 119,
+                                                    "reasoning": 7,
+                                                    "cost": {"total": 0.0027945}}}})]
+        tot = jroute.parse_pi_usage("\n".join(lines))
+        self.assertEqual(tot["input"], 18154)
+        self.assertEqual(tot["reasoning"], 7)
+        self.assertAlmostEqual(tot["cost"], 0.0027945)
+
+    def test_stream_summary_reports_what_was_actually_used(self):
+        stream = jroute.SessionStream(None, enabled=False)
+        stream.totals.update({"input": 18154, "output": 119, "cache_read": 354688,
+                              "reasoning": 7, "cost": 0.0028, "turns": 3})
+        summary = stream.summary()
+        for fragment in ("↑18.2k", "↓119", "cache 354.7k", "think 7", "$0.0028", "3 steps"):
+            self.assertIn(fragment, summary)
+
+    def test_stream_reads_only_new_lines_on_each_poll(self):
+        """Incremental reads are the whole point; reprinting the file every poll would flood."""
+        path = Path(tempfile.mkdtemp()) / "session.jsonl"
+        path.write_text("")
+        stream = jroute.SessionStream(path, enabled=True)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            path.write_text(json.dumps({"message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "first"}]}}) + "\n")
+            stream.poll()
+            first = buffer.getvalue()
+            stream.poll()  # no new bytes
+            self.assertEqual(buffer.getvalue(), first)
+        self.assertIn("first", first)
+        self.assertEqual(stream.totals["turns"], 0, "no usage block in that entry")
+
+    def test_stream_handles_a_partial_trailing_line(self):
+        path = Path(tempfile.mkdtemp()) / "session.jsonl"
+        stream = jroute.SessionStream(path, enabled=True)
+        entry = json.dumps({"message": {"usage": {"input": 42}}})
+        with redirect_stdout(io.StringIO()):
+            path.write_text(entry[:20])  # half a line, no newline yet
+            stream.poll()
+            self.assertEqual(stream.totals["turns"], 0)
+            with path.open("a") as fh:
+                fh.write(entry[20:] + "\n")
+            stream.poll()
+        self.assertEqual(stream.totals["turns"], 1)
+        self.assertEqual(stream.totals["input"], 42)
+
+    def test_stream_survives_a_missing_file(self):
+        stream = jroute.SessionStream(Path("/nonexistent/nope.jsonl"), enabled=True)
+        stream.poll()
+        self.assertEqual(stream.summary(), "")
 
 
 class TestLaunchArgv(unittest.TestCase):
