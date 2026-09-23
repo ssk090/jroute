@@ -531,15 +531,17 @@ that file, listing only issues that need a change.""",
 }
 
 
-SKILL_LINE = "Load these skills first and follow them: {names}."
+SKILL_LINE = "Read and follow these skills first: {names}."
 
 
 def brief_for(stage, task, config, plan_path, has_plan):
     """A routine task skips the plan stage, so the executor must not be told to follow a plan
     that was never written. That is the difference between the two execute briefs.
 
-    Skills are named here rather than passed as --skill so the whole skill is loaded only
-    when the stage runs, instead of paying its context load on every stage.
+    Skills are named here rather than passed as --skill so the whole skill is loaded only when
+    the stage runs, instead of paying its context load on every stage. "Read" rather than
+    "load" on purpose: implement, to-spec, and to-tickets are disable-model-invocation, so the
+    agent reaches them as files, and wording that implies a slash-command leaves it hunting.
     """
     key = "implement" if stage == "execute" and not has_plan else stage
     brief = BRIEFS[key].format(task=task, plan_path=plan_path,

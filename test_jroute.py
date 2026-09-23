@@ -680,7 +680,7 @@ class TestBriefFor(unittest.TestCase):
         for stage, expected in config["skills"].items():
             brief = jroute.brief_for(stage, "task", config, jroute.Path("/tmp/p.md"),
                                      has_plan=True)
-            self.assertIn("Load these skills first", brief)
+            self.assertIn("Read and follow these skills first", brief)
             for name in expected:
                 self.assertIn(name, brief)
 
