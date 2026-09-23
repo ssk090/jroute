@@ -580,6 +580,105 @@ class TestAnswerArgv(unittest.TestCase):
             jroute.answer_argv("mistral/large", "low")
 
 
+class TestBriefFor(unittest.TestCase):
+    """A routine task skips the plan stage, so the executor must never be told to follow a
+    plan document that was never written. This bug shipped once; the test is here so it
+    cannot ship twice."""
+
+    def test_execute_with_a_plan_points_at_the_plan_file(self):
+        brief = jroute.brief_for("execute", "do a thing", CONFIG, jroute.Path("/tmp/p.md"),
+                                 has_plan=True)
+        self.assertIn("/tmp/p.md", brief)
+        self.assertIn("Do not rewrite the plan", brief)
+
+    def test_execute_without_a_plan_does_not_reference_one(self):
+        brief = jroute.brief_for("execute", "add a --version flag", CONFIG,
+                                 jroute.Path("/tmp/p.md"), has_plan=False)
+        self.assertNotIn("plan at", brief)
+        self.assertIn("add a --version flag", brief, "the task text must carry the intent")
+        self.assertIn("no plan document to follow", brief)
+
+    def test_plan_brief_names_the_artifact_and_the_line_cap(self):
+        brief = jroute.brief_for("plan", "ticket CHP-1", CONFIG, jroute.Path("/tmp/p.md"),
+                                 has_plan=False)
+        self.assertIn("/tmp/p.md", brief)
+        self.assertIn(str(CONFIG["plan_line_cap"]), brief)
+
+    def test_every_stage_has_a_brief(self):
+        for stage in ("plan", "execute", "review", "implement"):
+            self.assertIn(stage, jroute.BRIEFS)
+
+    def test_the_direct_brief_bans_filler_prose(self):
+        brief = jroute.brief_for("execute", "x", CONFIG, jroute.Path("/tmp/p.md"),
+                                 has_plan=False)
+        self.assertIn("No preamble", brief)
+
+
+class TestProgress(unittest.TestCase):
+    def test_formats_elapsed_as_minutes_and_seconds(self):
+        self.assertEqual(jroute.format_elapsed(0), "0:00")
+        self.assertEqual(jroute.format_elapsed(9.7), "0:09")
+        self.assertEqual(jroute.format_elapsed(75), "1:15")
+        self.assertEqual(jroute.format_elapsed(3600), "60:00")
+        self.assertEqual(jroute.format_elapsed(-5), "0:00")
+
+    def test_spinner_is_silent_when_not_a_tty(self):
+        """Piped output must stay clean: no escape codes, no filler lines."""
+        spin = jroute.Spinner("test", enabled=False)
+        spin.tick("something")
+        spin.done("finished")
+        self.assertFalse(spin.shown)
+
+    def test_spinner_is_silent_before_its_delay_elapses(self):
+        """A fast call shows nothing, so no spinner flashes for a two-second Jev answer."""
+        spin = jroute.Spinner("test", delay=30, enabled=True)
+        spin.tick()
+        self.assertFalse(spin.shown)
+        spin.shown = True
+        with redirect_stdout(io.StringIO()):
+            spin.done()
+        self.assertFalse(spin.shown)
+
+    def test_spinner_prints_a_frame_once_the_delay_has_passed(self):
+        spin = jroute.Spinner("working", delay=0, enabled=True)
+        spin.started -= 5
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            spin.tick("reading jroute.py")
+        text = buffer.getvalue()
+        self.assertIn("working", text)
+        self.assertIn("0:05", text)
+        self.assertIn("reading jroute.py", text)
+
+    def test_chrome_filter_drops_pane_furniture(self):
+        for marker in jroute.CHROME:
+            self.assertTrue(any(marker in line for line in ["x", marker]),
+                            f"CHROME should contain {marker!r}")
+
+    def test_chrome_list_covers_the_observed_footers(self):
+        footers = ["↑16k ↓5 $0.161 (sub) 5.9%/272k (auto)  (openai-codex) gpt-6-astra",
+                   "escape interrupt · ctrl+c/ctrl+d clear/exit · / commands",
+                   "─────────────────────────────────────────"]
+        for footer in footers:
+            self.assertTrue(any(m in footer for m in jroute.CHROME),
+                            f"footer should be filtered: {footer!r}")
+
+
+class TestStatusVersion(unittest.TestCase):
+    def test_git_short_sha_is_a_nonempty_hex_abbreviation(self):
+        sha = jroute.git_short_sha()
+        self.assertRegex(sha, r"^[0-9a-f]{7,40}$")
+
+    def test_status_version_prints_the_sha_without_probing(self):
+        with patch.object(jroute, "cmd_status") as cmd, \
+             patch.object(jroute, "git_short_sha", return_value="abc1234"), \
+             patch.object(jroute.sys, "argv", ["jroute", "status", "--version"]), \
+             redirect_stdout(io.StringIO()) as out:
+            jroute.main()
+        self.assertEqual(out.getvalue().strip(), "abc1234")
+        cmd.assert_not_called()
+
+
 class TestLaunchArgv(unittest.TestCase):
     def test_pi_gets_the_effort_flag_for_codex_and_opencode(self):
         kind, argv = jroute.launch_argv("plan", "openai-codex/gpt-6-astra", "medium")

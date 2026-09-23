@@ -56,6 +56,17 @@ def keychain(service):
     return p.stdout.strip() if p.returncode == 0 else None
 
 
+def git_short_sha():
+    """The running checkout's short sha, so a status run can name the code it came from."""
+    try:
+        out = subprocess.run(["git", "-C", str(Path(__file__).parent),
+                              "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True)
+    except OSError:
+        return "unknown"
+    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else "unknown"
+
+
 def normalize_codex(raw):
     """Codex Plus: account windows plus a per-model availability map."""
     rl = raw.get("rate_limit") or {}
@@ -362,7 +373,12 @@ def jev_ask(state, questions):
 def classify(task):
     """One batched Jev call for the whole run, reduced to its answers map. Jev is optional:
     a miss is not an error, it just means every chain starts at its cheapest eligible model."""
-    response = jev_ask(task, JEV_QUESTIONS)
+    spin = Spinner("jev classifying")
+    spin.tick()
+    try:
+        response = jev_ask(task, JEV_QUESTIONS)
+    finally:
+        spin.done()
     if not response:
         return None
     return response.get("answers") or None
@@ -494,19 +510,34 @@ Reply with only the file path.""",
     "execute": """Implement the plan at {plan_path}. Load the skills it lists under
 "suggested skills". Follow its test seams. Run typecheck and the test suite, then commit to
 the current branch. Do not rewrite the plan. Reply with only the commit sha.""",
+    "implement": """Implement this change directly, with no plan document to follow:
+
+{task}
+
+Read only what you need. Run typecheck and the test suite, then commit to the current
+branch. Keep it the smallest change that works. Reply with only the commit sha.
+No preamble, no summary.""",
     "review": """Run /code-review since the merge-base, checking the diff against the
 acceptance criteria in {plan_path}. Append your findings under a "## review findings"
 heading in that file. Report only actionable findings.""",
 }
 
 
-def run_stage(stage, task, route, config, keep_panes=False, focus=False, timeout_s=900):
+def brief_for(stage, task, config, plan_path, has_plan):
+    """A routine task skips the plan stage, so the executor must not be told to follow a plan
+    that was never written. That is the difference between the two execute briefs."""
+    key = "implement" if stage == "execute" and not has_plan else stage
+    return BRIEFS[key].format(task=task, plan_path=plan_path,
+                              cap=config["plan_line_cap"])
+
+
+def run_stage(stage, task, route, config, keep_panes=False, focus=False, timeout_s=900,
+              has_plan=True):
     """Run one stage in its own pane. The pane is closed on success and kept on failure,
     so a failed stage can be read before deciding what to do with it."""
     plan_path = plan_path_for(task)
-    brief = BRIEFS[stage].format(task=task, plan_path=plan_path,
-                                 cap=config["plan_line_cap"])
-    if stage != "plan" and not plan_path.exists():
+    brief = brief_for(stage, task, config, plan_path, has_plan)
+    if stage != "plan" and has_plan and not plan_path.exists():
         print(f"  blocked: {plan_path} does not exist, run the plan stage first")
         return None
 
@@ -526,7 +557,11 @@ def run_stage(stage, task, route, config, keep_panes=False, focus=False, timeout
             print(f"  {stage}: a dialog is still up, leaving the pane open")
             keep = True
             return None
-        herdr("agent", "prompt", name, brief, "--wait", "--timeout", str(timeout_s * 1000))
+        herdr("agent", "prompt", name, brief)  # submit, then watch for real progress
+        settled = wait_for_stage(name, pane_id, timeout_s)
+        if settled == "timeout":
+            keep = True
+            return None
         usage = read_pi_usage(session) if kind == "pi" and session else None
         record = {"stage": stage, "model": route, "pane": pane_id, "session": session,
                   "usage": usage, "plan": str(plan_path)}
@@ -556,6 +591,112 @@ def run_stage(stage, task, route, config, keep_panes=False, focus=False, timeout
         if not keep:
             subprocess.run(["herdr", "pane", "close", pane_id],
                            capture_output=True, text=True)
+
+
+def format_elapsed(seconds, width=60):
+    """mm:ss, used for every live progress line."""
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+CHROME = ("esc interrupt", "escape interrupt", "(auto)", "Ctrl+P", "press ctrl",
+          "└", "┘", "┌", "┐", "─", "▄", "▀")
+
+
+class Spinner:
+    """A live progress line. Appears only after `delay` seconds, so a fast call shows
+    nothing, and only on a TTY, so piped output stays clean."""
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, label, delay=0.8, enabled=None, pad=110):
+        self.label = label
+        self.delay = delay
+        self.enabled = sys.stdout.isatty() if enabled is None else enabled
+        self.pad = pad
+        self.started = time.time()
+        self.shown = False
+        self.frame = 0
+
+    def tick(self, detail=""):
+        if not self.enabled:
+            return
+        elapsed = time.time() - self.started
+        if not self.shown and elapsed < self.delay:
+            return
+        self.shown = True
+        glyph = self.FRAMES[self.frame % len(self.FRAMES)]
+        self.frame += 1
+        line = f"  {glyph} {self.label} {format_elapsed(elapsed)}"
+        if detail:
+            line += f"  {detail}"
+        print("\r" + line[:self.pad].ljust(self.pad), end="", flush=True)
+
+    def done(self, detail=""):
+        if self.enabled and self.shown:
+            print("\r" + " " * self.pad + "\r", end="", flush=True)
+        self.shown = False
+        if detail:
+            print(f"  {detail}", flush=True)
+
+    def __enter__(self):
+        self.tick()
+        return self
+
+    def __exit__(self, *_exc):
+        self.done()
+
+
+def pane_activity(pane_id, width=64):
+    """The agent's current visible activity, scraped from its pane, for the progress line.
+    Best effort by design: progress reporting must never be the reason a run fails."""
+    try:
+        out = herdr("pane", "read", pane_id, "--source", "recent-unwrapped",
+                    "--lines", "10", "--format", "text", timeout=20)
+    except Exception:
+        return ""
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if not line or any(marker in line for marker in CHROME):
+            continue
+        return line[:width]
+    return ""
+
+
+def agent_status(target):
+    try:
+        return herdr_json("agent", "get", target, timeout=30)["result"]["agent"]["agent_status"]
+    except Exception:
+        return "unknown"
+
+
+def wait_for_stage(target, pane_id, timeout_s, poll=3.0):
+    """Submit nothing, just watch. Replaces `agent prompt --wait`, which blocks silently for
+    minutes; this shows elapsed time and what the agent is doing right now.
+
+    A settled state is idle, done, or blocked. A submission is accepted before the agent
+    flips to working, so the first seconds are spent waiting for that transition."""
+    deadline = time.time() + timeout_s
+    spin = Spinner(f"{target} working")
+    saw_working = False
+    while time.time() < deadline:
+        status = agent_status(target)
+        if status in ("working", "blocked"):
+            saw_working = True
+        elif status in ("idle", "done"):
+            if saw_working:
+                spin.done(f"{target} finished in {format_elapsed(time.time() - spin.started)}")
+                return status
+            # It may have finished before the first poll. Give the transition a few seconds
+            # before accepting idle, then let the artifact checks decide if anything happened.
+            if time.time() - spin.started > 8:
+                spin.done(f"{target} settled in {format_elapsed(time.time() - spin.started)}")
+                return status
+        spin.tick(pane_activity(pane_id))
+        time.sleep(poll)
+    spin.done()
+    print(f"  {target}: timed out after {format_elapsed(timeout_s)}, leaving the pane open")
+    return "timeout"
 
 
 # --------------------------------------------------------------------------------------
@@ -654,17 +795,30 @@ def cmd_answer(task, route, effort, timeout_s):
     """Questions get an answer on stdout, not a plan artifact and a pane. That is the
     difference between a 300k-token detour through Astra and a ten-second cheap reply."""
     argv = answer_argv(route, effort)
-    print(f"  answer   -> {route}  ({effort})  headless\n", flush=True)
+    print(f"  answer   -> {route}  ({effort})  headless", flush=True)
     try:
-        proc = subprocess.run(argv + ["--", task], capture_output=True, text=True,
-                              timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        print(f"  answer: timed out after {timeout_s}s", file=sys.stderr)
+        proc = subprocess.Popen(argv + ["--", task], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    except OSError as exc:
+        print(f"  answer: could not launch: {exc}", file=sys.stderr)
         return 1
+    spin = Spinner("thinking")
+    deadline = time.time() + timeout_s
+    while proc.poll() is None and time.time() < deadline:
+        spin.tick()
+        time.sleep(0.4)
+    if proc.poll() is None:
+        proc.kill()
+        spin.done()
+        print(f"  answer: timed out after {format_elapsed(timeout_s)}", file=sys.stderr)
+        return 1
+    out, err = proc.communicate()
+    spin.done()
     if proc.returncode != 0:
-        print(f"  answer: exit {proc.returncode}: {proc.stderr.strip()[:300]}", file=sys.stderr)
+        print(f"  answer: exit {proc.returncode}: {err.strip()[:300]}", file=sys.stderr)
         return 1
-    for line in proc.stdout.splitlines():
+    print()
+    for line in out.splitlines():
         if not any(line.startswith(marker) for marker in BANNER):
             print(line)
     return 0
@@ -731,7 +885,8 @@ def cmd_run(task, config, args):
             print(f"      brief -> {plan_path_for(task)}")
             continue
         rec = run_stage(stage, task, route, config, keep_panes=args.keep_panes,
-                        focus=args.focus, timeout_s=args.timeout)
+                        focus=args.focus, timeout_s=args.timeout,
+                        has_plan="plan" in shape)
         if not rec:
             print(f"  {stage}: aborted, stopping the pipeline")
             exit_code = 1
@@ -769,6 +924,8 @@ def main():
     status = sub.add_parser("status", help="quota pools and resolved stage routes")
     status.add_argument("--json", action="store_true",
                         help="emit one machine-readable JSON object instead of text")
+    status.add_argument("--version", action="store_true",
+                        help="print the git short sha of the running checkout and exit")
 
     run = sub.add_parser("run", help="route and run the pipeline")
     run.add_argument("task")
@@ -785,6 +942,11 @@ def main():
     log.add_argument("-n", type=int, default=20)
 
     args = ap.parse_args()
+
+    if args.cmd == "status" and args.version:
+        print(git_short_sha())
+        return
+
     config = json.loads(CONFIG_PATH.read_text())
 
     if args.cmd == "status":
