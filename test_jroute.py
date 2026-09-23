@@ -5,8 +5,12 @@ token accounting, and redaction. These are the seams where routing bugs would hi
     python3 -m unittest test_jroute -v
 """
 
+import io
 import json
+import sys
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import Mock, patch
 
 import jroute
 
@@ -219,6 +223,184 @@ class TestPlanPath(unittest.TestCase):
 
     def test_handles_a_task_with_no_useful_characters(self):
         self.assertEqual(jroute.plan_path_for("!!!").name, "task.md")
+
+
+EXPECTED_TEXT_ALL_OK = (
+    "jroute status\n"
+    "\n"
+    "codex        OK        5h 10% (reset 4h41m)  7d 56% (reset 45h37m)\n"
+    "cursor       OK        auto 73.2%  api 8.6%  total 67.3%\n"
+    "             auto bucket contains 2 models (composer-2.5, grok-4.5 ladders)\n"
+    "opencode-go  FLAT      1 models, no usage endpoint exists\n"
+    "\n"
+    "stage routes\n"
+    "  plan     -> openai-codex/gpt-6-astra  (medium)\n"
+    "  execute  -> opencode-go/deepseek-v4.1-flash  (low)\n"
+    "  review   -> opencode-go/glm-5.3  (medium)\n"
+    "\n"
+    "exclusions\n"
+    "  anthropic model, excluded by policy: cursor/claude-opus-5-high\n"
+)
+
+EXPECTED_TEXT_PROBE_ERROR = (
+    "jroute status\n"
+    "\n"
+    "codex        ERROR    RuntimeError: boom\n"
+    "cursor       OK        auto 73.2%  api 8.6%  total 67.3%\n"
+    "             auto bucket contains 2 models (composer-2.5, grok-4.5 ladders)\n"
+    "opencode-go  FLAT      1 models, no usage endpoint exists\n"
+    "\n"
+    "stage routes\n"
+    "  plan     -> cursor/gpt-5.6-sol-high  (medium)\n"
+    "  execute  -> opencode-go/deepseek-v4.1-flash  (low)\n"
+    "  review   -> opencode-go/glm-5.3  (medium)\n"
+    "\n"
+    "exclusions\n"
+    "  codex quota unknown (probe failed): openai-codex/gpt-6-astra, openai-codex/gpt-5.6-sol\n"
+    "  anthropic model, excluded by policy: cursor/claude-opus-5-high\n"
+)
+
+
+def status_json(snaps, errors, config=CONFIG):
+    """Run cmd_status in JSON mode with probe_all stubbed; return (parsed, probe_mock)."""
+    buf = io.StringIO()
+    with patch.object(jroute, "probe_all", return_value=(snaps, errors)) as probe:
+        with redirect_stdout(buf):
+            jroute.cmd_status(config, True)
+    return json.loads(buf.getvalue()), probe
+
+
+def run_main(argv):
+    """Invoke main() with argv, a stubbed config path, and cmd_status captured."""
+    fake_config = Mock(read_text=lambda: json.dumps(CONFIG))
+    with patch.object(sys, "argv", ["jroute", *argv]), \
+            patch.object(jroute, "CONFIG_PATH", fake_config), \
+            patch.object(jroute, "cmd_status") as status:
+        jroute.main()
+    return status
+
+
+class TestStatusJson(unittest.TestCase):
+    def test_emits_exactly_one_object_with_the_documented_top_level_schema(self):
+        payload, probe = status_json(ALL_OK, {})
+        self.assertEqual(set(payload), {"snapshots", "errors", "routes", "exclusions"})
+        self.assertEqual(payload["errors"], {})
+        probe.assert_called_once()
+
+    def test_snapshots_preserve_the_normalized_data_and_source_set(self):
+        payload, _ = status_json(ALL_OK, {})
+        self.assertEqual(set(payload["snapshots"]), set(ALL_OK))
+        codex = payload["snapshots"]["codex"]
+        self.assertEqual(codex["primary_used"], 10.0)
+        self.assertIsInstance(codex["primary_used"], float)
+        self.assertEqual(codex["reset_primary_s"], 16892)
+        self.assertIs(codex["allowed"], True)
+        self.assertIs(codex["limit_reached"], False)
+
+    def test_cursor_auto_bucket_serializes_sorted_without_mutating_the_snapshot(self):
+        payload, _ = status_json(ALL_OK, {})
+        self.assertEqual(payload["snapshots"]["cursor"]["auto_bucket"],
+                         ["composer-2.5", "grok-4.5"])
+        self.assertIsInstance(ALL_OK["cursor"]["auto_bucket"], set)
+        self.assertEqual(ALL_OK["cursor"]["auto_bucket"], {"composer-2.5", "grok-4.5"})
+
+    def test_routes_map_every_stage_to_model_and_effort(self):
+        payload, _ = status_json(ALL_OK, {})
+        self.assertEqual(payload["routes"], {
+            "plan": {"model": "openai-codex/gpt-6-astra", "effort": "medium"},
+            "execute": {"model": "opencode-go/deepseek-v4.1-flash", "effort": "low"},
+            "review": {"model": "opencode-go/glm-5.3", "effort": "medium"},
+        })
+
+    def test_exclusions_are_ordered_model_reason_entries(self):
+        payload, _ = status_json(ALL_OK, {})
+        self.assertEqual(payload["exclusions"],
+                         [{"model": "cursor/claude-opus-5-high",
+                           "reason": "anthropic model, excluded by policy"}])
+        all_models = [m for chain in CONFIG["stages"].values() for m in chain]
+        _, expected = jroute.eligible(ALL_OK, CONFIG, all_models)
+        self.assertEqual([(e["model"], e["reason"]) for e in payload["exclusions"]], expected)
+
+    def test_gated_variant_falls_back_and_agrees_with_eligible_and_resolve(self):
+        snaps = dict(ALL_OK, codex=dict(CODEX_OK, primary_used=71.0))
+        payload, _ = status_json(snaps, {})
+        all_models = [m for chain in CONFIG["stages"].values() for m in chain]
+        ok_ids, expected = jroute.eligible(snaps, CONFIG, all_models)
+        self.assertEqual(payload["routes"]["plan"]["model"],
+                         jroute.resolve("plan", ok_ids, CONFIG))
+        self.assertEqual(payload["routes"]["plan"]["model"], "cursor/gpt-5.6-sol-high")
+        self.assertEqual([(e["model"], e["reason"]) for e in payload["exclusions"]], expected)
+        self.assertIn("5h", payload["exclusions"][0]["reason"])
+
+    def test_total_probe_failure_still_emits_a_complete_report(self):
+        errors = {p: "probe failed" for p in ALL_OK}
+        payload, _ = status_json({}, errors)
+        self.assertEqual(payload["snapshots"], {})
+        self.assertEqual(payload["errors"], errors)
+        self.assertEqual(payload["routes"], {
+            "plan": {"model": "opencode-go/glm-5.3", "effort": "medium"},
+            "execute": {"model": "opencode-go/deepseek-v4.1-flash", "effort": "low"},
+            "review": {"model": "opencode-go/glm-5.3", "effort": "medium"},
+        })
+        self.assertNotIn("opencode-go", {e["model"].split("/")[0]
+                                         for e in payload["exclusions"]})
+
+    def test_null_route_when_the_whole_chain_is_gated(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["stages"] = {"plan": ["openai-codex/gpt-6-astra"]}
+        snaps = dict(ALL_OK, codex=dict(CODEX_OK, primary_used=99.0))
+        payload, _ = status_json(snaps, {}, config)
+        self.assertIsNone(payload["routes"]["plan"]["model"])
+        self.assertEqual(payload["routes"]["plan"]["effort"], "medium")
+
+    def test_missing_quota_values_serialize_as_null(self):
+        snaps = {"codex": jroute.normalize_codex({}), "cursor": jroute.normalize_cursor({})}
+        payload, _ = status_json(snaps, {})
+        self.assertIsNone(payload["snapshots"]["codex"]["primary_used"])
+        self.assertIsNone(payload["snapshots"]["codex"]["secondary_used"])
+        self.assertIsNone(payload["snapshots"]["cursor"]["total_used"])
+        self.assertEqual(payload["snapshots"]["cursor"]["auto_bucket"], [])
+
+
+class TestStatusTextUnchanged(unittest.TestCase):
+    def test_default_text_output_is_unchanged(self):
+        buf = io.StringIO()
+        with patch.object(jroute, "probe_all", return_value=(ALL_OK, {})):
+            with redirect_stdout(buf):
+                jroute.cmd_status(CONFIG)
+        self.assertEqual(buf.getvalue(), EXPECTED_TEXT_ALL_OK)
+
+    def test_probe_error_text_output_is_unchanged(self):
+        snaps = {"cursor": CURSOR_OK, "opencode-go": OPENCODE_OK}
+        buf = io.StringIO()
+        with patch.object(jroute, "probe_all", return_value=(snaps, {"codex": "RuntimeError: boom"})):
+            with redirect_stdout(buf):
+                jroute.cmd_status(CONFIG)
+        self.assertEqual(buf.getvalue(), EXPECTED_TEXT_PROBE_ERROR)
+
+
+class TestStatusCli(unittest.TestCase):
+    def test_json_flag_dispatches_json_mode(self):
+        status = run_main(["status", "--json"])
+        status.assert_called_once_with(CONFIG, True)
+
+    def test_status_defaults_to_text_mode(self):
+        status = run_main(["status"])
+        status.assert_called_once_with(CONFIG, False)
+
+    def test_status_help_documents_the_json_flag(self):
+        buf = io.StringIO()
+        with patch.object(sys, "argv", ["jroute", "status", "--help"]), \
+                redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            jroute.main()
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn("--json", buf.getvalue())
+
+    def test_other_subcommands_reject_the_json_flag(self):
+        with patch.object(sys, "argv", ["jroute", "log", "--json"]), \
+                redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            jroute.main()
+        self.assertEqual(cm.exception.code, 2)
 
 
 class TestLaunchArgv(unittest.TestCase):

@@ -422,16 +422,36 @@ def fmt_reset(seconds):
     return f"{mins // 60}h{mins % 60:02d}m" if mins >= 60 else f"{mins}m"
 
 
-def cmd_status(config):
+def cmd_status(config, json_mode=False):
     snaps, errors = probe_all()
+    all_models = [m for chain in config["stages"].values() for m in chain]
+    ok_ids, excluded = eligible(snaps, config, all_models)
+
+    if json_mode:
+        serializable = {}
+        for name, snap in snaps.items():
+            snap = dict(snap)
+            if "auto_bucket" in snap:
+                snap["auto_bucket"] = sorted(snap["auto_bucket"])
+            serializable[name] = snap
+        print(json.dumps({
+            "snapshots": serializable,
+            "errors": errors,
+            "routes": {stage: {"model": resolve(stage, ok_ids, config),
+                               "effort": config["effort"].get(stage, "")}
+                       for stage in config["stages"]},
+            "exclusions": [{"model": mid, "reason": reason} for mid, reason in excluded],
+        }))
+        return
+
     print("jroute status\n")
     codex = snaps.get("codex")
     if codex:
-        ok, excluded = eligible(snaps, config, ["openai-codex/gpt-6-astra"])
-        print(f"codex        {'OK       ' if ok else 'GATED    '} "
+        codex_ok, codex_excluded = eligible(snaps, config, ["openai-codex/gpt-6-astra"])
+        print(f"codex        {'OK       ' if codex_ok else 'GATED    '} "
               f"5h {codex['primary_used']:.0f}% (reset {fmt_reset(codex['reset_primary_s'])})  "
               f"7d {codex['secondary_used']:.0f}% (reset {fmt_reset(codex['reset_secondary_s'])})")
-        for mid, reason in excluded:
+        for mid, reason in codex_excluded:
             print(f"             excluded: {reason}")
         for model, avail in (codex.get("model_available") or {}).items():
             if not avail:
@@ -455,8 +475,6 @@ def cmd_status(config):
         print(f"opencode-go  ERROR    {errors.get('opencode-go')}")
 
     print("\nstage routes")
-    all_models = [m for chain in config["stages"].values() for m in chain]
-    ok_ids, excluded = eligible(snaps, config, all_models)
     seen_excluded = {}
     for mid, reason in excluded:
         seen_excluded.setdefault(reason, []).append(mid)
@@ -529,7 +547,9 @@ def main():
     ap = argparse.ArgumentParser(prog="jroute", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("status", help="quota pools and resolved stage routes")
+    status = sub.add_parser("status", help="quota pools and resolved stage routes")
+    status.add_argument("--json", action="store_true",
+                        help="emit one machine-readable JSON object instead of text")
 
     run = sub.add_parser("run", help="route and run the pipeline")
     run.add_argument("task")
@@ -545,7 +565,7 @@ def main():
     config = json.loads(CONFIG_PATH.read_text())
 
     if args.cmd == "status":
-        cmd_status(config)
+        cmd_status(config, args.json)
     elif args.cmd == "run":
         if not args.dry_run and not inside_herdr():
             sys.exit("jroute run needs $HERDR_ENV=1; use --dry-run outside Herdr")
